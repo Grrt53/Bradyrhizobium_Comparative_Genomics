@@ -334,25 +334,496 @@ print(f"Output file: {output_file}")
 
 # STEP: 6  Alignment Filtering with BMGE
 
-java -jar BMGE.jar -i super_matrix_concatenado.fas -t AA -of supermatriz_filtrada.fas
+java -jar BMGE.jar \
+    -i super_matrix_concatenated.fas \
+    -t AA \
+    -of supermatrix_filtered.fas
 
 
 # STEP: 7 Phylogenetic Reconstruction with IQ-TREE
 
-iqtree -s supermatriz_filtrada.fas \
+iqtree -s supermatrix_filtered.fas \
        -st AA \
        -bb 1000 \
        -bnni \
        -T 45 \
        -seed 1998 \
        -m TEST \
-       -o Rhodoplanes_serenus,Rhodoplanes_elegans,Rhodoplanes_elegans \
+       -o Rhodoplanes_serenus,Rhodoplanes_elegans \
        -pre bradyrhizobium_phylogeny
 
+##################################################################
+##################################################################
+### Pangenome analysis
+
+# Activate panaroo_env
+
+# STEP: 1 
+
+#!/bin/bash
+
+BASE_DIR="//13_pangenoma_NOVO"
+
+cd "$BASE_DIR" || exit
+
+for dir in */; do
+
+    # Skip Panaroo result directories
+    if [[ "$dir" == panaroo_results_* ]]; then
+        continue
+    fi
+
+    echo "========================================"
+    echo "Processing: $dir"
+    echo "========================================"
+
+    cd "$dir" || continue
+
+    files=( *.gff *.gff3 )
+
+    valid_files=()
+    for f in "${files[@]}"; do
+        [ -e "$f" ] && valid_files+=("$f")
+    done
+
+    if [ ${#valid_files[@]} -eq 0 ]; then
+        echo "No GFF/GFF3 files found in $dir. Skipping..."
+        cd ..
+        continue
+    fi
+
+    if [ ${#valid_files[@]} -lt 2 ]; then
+        echo "Too few genomes (${#valid_files[@]}) in $dir. Skipping..."
+        cd ..
+        continue
+    fi
+
+    OUT_DIR="../panaroo_results_${dir%/}"
+
+    echo "Running Panaroo..."
+
+    panaroo -i "${valid_files[@]}" \
+        -o "$OUT_DIR" \
+        -c 0.95 \
+        -f 0.85 \
+        --clean-mode moderate \
+        --refind_prop_match 0.5 \
+        --search_radius 1000 \
+        --threads 35 \
+        --remove-invalid-genes
+
+    echo "Finished processing: $dir"
+
+    cd ..
+done
+
+echo "All directories have been processed."
 
 
+# STEP: 2 Analysis of pangenome
 
+# Load libraries
+library(pagoo)
+library(micropan)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(scales)
+library(stringr)
+library(ggrepel)
+library(foreach)
+library(doParallel)
+library(doRNG)
+library(broom)
 
+# ------------------------------------------------------------------------
+# 1. CONFIGURATION
+# ------------------------------------------------------------------------
+base_dir <- "/media/mordor/hector/brady_spp/13_pangenoma_NOVO"
 
+# Find all gene_presence_absence.csv files (recursive)
+files <- list.files(
+  path = base_dir,
+  pattern = "gene_presence_absence\\.csv$",
+  recursive = TRUE,
+  full.names = TRUE
+)
 
+if (length(files) == 0) {
+  stop("No gene_presence_absence.csv files found in ", base_dir)
+} else {
+  cat("Found", length(files), "CSV files.\n")
+}
 
+# ------------------------------------------------------------------------
+# 2. MAIN FUNCTION (PARALLELIZED) WITH FIXED SEED
+# ------------------------------------------------------------------------
+get_pan_metrics_parallel <- function(files, base_dir) {
+  
+  n_cores <- min(parallel::detectCores() - 1, 50)
+  cl <- makeCluster(n_cores)
+  registerDoParallel(cl)
+  cat("Using", n_cores, "cores for parallel processing...\n")
+  
+  # --- GLOBAL SEED: set ONCE before foreach.
+  #     doRNG handles generating independent streams for each iteration.
+  seed <- 1998
+  set.seed(seed)
+  
+  results <- foreach(
+    f = files, 
+    .packages = c("pagoo", "micropan", "dplyr", "stringr"),
+    .combine = function(...) {
+      lists <- list(...)
+      list(
+        metrics = bind_rows(lapply(lists, function(x) x$metrics)),
+        unique_genes = bind_rows(lapply(lists, function(x) x$unique_genes)),
+        curves = bind_rows(lapply(lists, function(x) x$curves)),
+        all_clusters = bind_rows(lapply(lists, function(x) x$all_clusters))
+      )
+    }
+  ) %dorng% {
+    
+    # Extract species name (folder containing the CSV)
+    spp <- basename(dirname(f))
+    if (spp == "" || spp == "." || spp == "/") {
+      rel_path <- sub(paste0(base_dir, "/"), "", f)
+      spp <- strsplit(rel_path, "/")[[1]][1]
+    }
+    
+    cat("Processing:", spp, "\n")
+    
+    # Initialize outputs
+    metrics_out <- NULL
+    unique_genes_out <- NULL
+    curve_out <- NULL
+    clusters_out <- NULL
+    
+    # Read Panaroo data
+    pan_obj <- tryCatch({
+      pagoo::panaroo_2_pagoo(gene_presence_absence_csv = f)
+    }, error = function(e) {
+      cat("Error in", spp, ":", e$message, "\n")
+      return(NULL)
+    })
+    
+    if (is.null(pan_obj)) {
+      return(list(metrics = metrics_out, unique_genes = unique_genes_out, 
+                  curves = curve_out, all_clusters = clusters_out))
+    }
+    
+    # ------------------------------------------------------------
+    # 1. Save gene families for this species (with category)
+    # ------------------------------------------------------------
+    output_dir <- dirname(f)
+    
+    # Get all clusters as data.frame
+    clusters_df <- as.data.frame(pan_obj$clusters)
+    # Add category column: core, shell, cloud
+    clusters_df$category <- "cloud"  # default
+    clusters_df$category[clusters_df$cluster %in% pan_obj$core_clusters$cluster] <- "core"
+    clusters_df$category[clusters_df$cluster %in% pan_obj$shell_clusters$cluster] <- "shell"
+    
+    # Save individual file per species
+    write.csv(
+      clusters_df,
+      file = file.path(output_dir, paste0(spp, "_gene_families.csv")),
+      row.names = FALSE
+    )
+    
+    # Add species column for the general file
+    clusters_df$species <- spp
+    clusters_out <- clusters_df   # to accumulate
+    
+    # ------------------------------------------------------------
+    # 2. Main metrics (using summary_stats)
+    # ------------------------------------------------------------
+    pan_stats <- pan_obj$summary_stats
+    
+    # Alpha (power law)
+    alpha <- tryCatch({
+      fit <- pan_obj$pg_power_law_fit()
+      attr(fit, "alpha")
+    }, error = function(e) {
+      cat("Error calculating alpha for", spp, ":", e$message, "\n")
+      NA
+    })
+    
+    # Fluidity
+    fluidity <- tryCatch({
+      micropan::fluidity(pan_obj$pan_matrix, n.sim = 500)
+    }, error = function(e) {
+      cat("Error calculating fluidity for", spp, ":", e$message, "\n")
+      c(NA, NA)
+    })
+    
+    # Main metrics
+    metrics_out <- data.frame(
+      species = spp,
+      pan_n_genomes = nrow(pan_obj$organisms),
+      pan_total = pan_stats[1, 2],
+      core = pan_stats[2, 2],
+      shell = pan_stats[3, 2],
+      cloud = pan_stats[4, 2],
+      alpha = alpha,
+      fluidity_mean = ifelse(is.null(fluidity[1]), NA, fluidity[1]),
+      fluidity_std = ifelse(is.null(fluidity[2]), NA, fluidity[2]),
+      stringsAsFactors = FALSE
+    )
+    
+    # ------------------------------------------------------------
+    # 3. Unique genes per genome
+    # ------------------------------------------------------------
+    pan_matrix <- as.data.frame(pan_obj$pan_matrix)
+    unique_genes <- rowSums(pan_matrix[, colSums(pan_matrix) == 1, drop = FALSE])
+    
+    unique_genes_out <- data.frame(
+      genome = rownames(pan_matrix),
+      species = spp,
+      unique_genes = unique_genes,
+      total_genes = rowSums(pan_matrix),
+      perc_unique = (unique_genes / rowSums(pan_matrix)) * 100,
+      stringsAsFactors = FALSE
+    )
+    
+    # Save individual unique genes file
+    write.csv(
+      unique_genes_out,
+      file = file.path(output_dir, paste0(spp, "_unique_genes_per_genome.csv")),
+      row.names = FALSE
+    )
+    
+    # ------------------------------------------------------------
+    # 4. Accumulation curve (only if >=9 genomes)
+    # ------------------------------------------------------------
+    n_genomes <- nrow(pan_obj$organisms)
+    if (n_genomes >= 9) {
+      pan_matrix_mat <- as.matrix(pan_obj$pan_matrix)
+      accum_curve <- sapply(1:n_genomes, function(k) {
+        mean(replicate(500, {
+          sampled <- sample(n_genomes, k)
+          sum(colSums(pan_matrix_mat[sampled, , drop = FALSE]) > 0)
+        }))
+      })
+      
+      curve_out <- data.frame(
+        species = spp,
+        alpha = alpha,
+        genomes = 1:n_genomes,
+        genes = accum_curve,
+        stringsAsFactors = FALSE
+      )
+    } else {
+      cat(spp, "has only", n_genomes, "genomes. Insufficient for accumulation curve.\n")
+    }
+    
+    # Return all elements
+    list(metrics = metrics_out, 
+         unique_genes = unique_genes_out, 
+         curves = curve_out,
+         all_clusters = clusters_out)
+  }
+  
+  stopCluster(cl)
+  return(results)
+}
+
+# ------------------------------------------------------------------------
+# 3. RUN ANALYSIS
+# ------------------------------------------------------------------------
+cat("\nStarting analysis (core/shell/cloud from summary_stats, fixed seed)...\n")
+results <- get_pan_metrics_parallel(files, base_dir)
+
+# Save main metrics
+write.csv(results$metrics, 
+          file.path(base_dir, "pangenome_metrics_all_species.csv"), 
+          row.names = FALSE)
+
+# Save combined unique genes
+if (!is.null(results$unique_genes) && nrow(results$unique_genes) > 0) {
+  write.csv(results$unique_genes, 
+            file.path(base_dir, "unique_genes_all_species.csv"), 
+            row.names = FALSE)
+}
+
+# Save combined accumulation curves
+if (!is.null(results$curves) && nrow(results$curves) > 0) {
+  write.csv(results$curves, 
+            file.path(base_dir, "pangenome_accumulation_curves.csv"), 
+            row.names = FALSE)
+}
+
+# Save the GENERAL file of all gene families
+if (!is.null(results$all_clusters) && nrow(results$all_clusters) > 0) {
+  write.csv(results$all_clusters, 
+            file.path(base_dir, "all_species_gene_families.csv"), 
+            row.names = FALSE)
+  cat("General gene families file saved to:", 
+      file.path(base_dir, "all_species_gene_families.csv"), "\n")
+}
+
+# ------------------------------------------------------------------------
+# 4. UNIQUE GENE PLOTS
+# ------------------------------------------------------------------------
+p_abs <- ggplot(results$unique_genes, aes(x = species, y = unique_genes, fill = species)) +
+  geom_boxplot() +
+  labs(title = "Unique Genes by Species - Absolute",
+       x = "Species",
+       y = "Number of Unique Genes") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        legend.position = "none") +
+  scale_fill_discrete() +
+  scale_y_continuous(labels = comma)
+
+p_perc <- ggplot(results$unique_genes, aes(x = species, y = perc_unique, fill = species)) +
+  geom_boxplot() +
+  labs(title = "Unique Genes by Species - Relative (%)",
+       x = "Species",
+       y = "Percentage of Unique Genes") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        legend.position = "none") +
+  scale_fill_discrete() +
+  scale_y_continuous(labels = comma)
+
+ggsave(file.path(base_dir, "unique_genes_absolute.png"), p_abs, width = 15, height = 8, dpi = 300)
+ggsave(file.path(base_dir, "unique_genes_percentage.png"), p_perc, width = 15, height = 8, dpi = 300)
+
+# ------------------------------------------------------------------------
+# 5. GLOBAL ACCUMULATION CURVES
+# ------------------------------------------------------------------------
+p_global <- ggplot(results$curves, aes(x = genomes, y = genes, color = species)) +
+  geom_line(linewidth = 0.8) +
+  geom_text_repel(
+    data = results$curves %>% group_by(species) %>% filter(genomes == max(genomes)),
+    aes(label = paste0(species, " (α=", round(alpha, 2), ")")),
+    size = 3,
+    hjust = 0,
+    direction = "y",
+    nudge_x = 10,
+    segment.size = 0.2,
+    show.legend = FALSE
+  ) +
+  labs(title = "Pangenome Accumulation Curves",
+       x = "Number of Genomes",
+       y = "Gene Families") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_color_manual(values = hue_pal()(length(unique(results$curves$species)))) +
+  theme(legend.position = "none") +
+  expand_limits(x = max(results$curves$genomes) * 1.2)
+
+ggsave(file.path(base_dir, "global_pangenome_curves_with_alpha.png"), 
+       p_global, width = 12, height = 8, dpi = 500)
+
+# ------------------------------------------------------------------------
+# 6. FLUIDITY vs. SATURATION ANALYSIS (WITH PREFERRED EQUATION)
+# ------------------------------------------------------------------------
+metrics_complete <- results$metrics %>% 
+  filter(!is.na(alpha) & !is.na(fluidity_mean))
+
+if (nrow(metrics_complete) >= 3) {
+  
+  cor_spearman <- cor.test(metrics_complete$alpha, metrics_complete$fluidity_mean, 
+                           method = "spearman", exact = FALSE)
+  
+  model <- lm(fluidity_mean ~ alpha, data = metrics_complete)
+  model_summary <- summary(model)
+  model_anova <- anova(model)
+  
+  intercept <- coef(model)[1]
+  slope <- coef(model)[2]
+  r_squared_adj <- model_summary$adj.r.squared
+  
+  # Position for annotations (upper right corner)
+  x_pos <- max(metrics_complete$alpha) - 0.01
+  y_pos <- max(metrics_complete$fluidity_mean) - 0.01
+  
+  intercept_fmt <- sprintf("%.4f", round(intercept, 4))
+  slope_fmt <- sprintf("%.4f", round(abs(slope), 4))
+  r2_adj_fmt <- sprintf("%.4f", round(r_squared_adj, 4))
+  
+  # Equation with minus sign (as in your version)
+  eq_label <- bquote(phi == .(intercept_fmt) - .(slope_fmt) ~ alpha)
+  r2_label <- bquote(italic(R)^2 ~ adj == .(r2_adj_fmt))
+  
+  p_saturation <- ggplot(metrics_complete, aes(x = alpha, y = fluidity_mean)) +
+    geom_point(aes(size = pan_n_genomes, color = core), alpha = 0.7) +
+    geom_smooth(method = "lm", formula = y ~ x, se = TRUE, color = "black", linetype = "dashed") +
+    geom_text_repel(aes(label = species), size = 3, max.overlaps = 20) +
+    annotate("text", x = x_pos, y = y_pos, label = deparse(eq_label), parse = TRUE,
+             hjust = 1, vjust = 1, size = 3) +
+    annotate("text", x = x_pos, y = y_pos - 0.008, label = deparse(r2_label), parse = TRUE,
+             hjust = 1, vjust = 1, size = 3) +
+    labs(title = "Genomic Fluidity vs. Pangenome Saturation",
+         x = "Pangenome Saturation (α)",
+         y = "Genomic Fluidity (φ)",
+         size = "Number of Genomes",
+         color = "Core Genes") +
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    scale_color_viridis_c(option = "plasma") +
+    scale_size_continuous(range = c(3, 8)) +
+    theme(legend.position = "right")
+  
+  ggsave(file.path(base_dir, "genomic_fluidity_vs_saturation_final.png"), 
+         p_saturation, width = 10, height = 8, dpi = 500)
+  
+  # ----------------------------------------------------------------------
+  # SAVE STATISTICAL RESULTS WITH P-VALUES IN SCIENTIFIC NOTATION
+  # ----------------------------------------------------------------------
+  
+  # Save statistical results (ALWAYS in scientific notation)
+  sink(file.path(base_dir, "fluidity_alpha_regression_summary.txt"))
+  cat("=== GENOMIC FLUIDITY vs. SATURATION ANALYSIS ===\n\n")
+  cat("Spearman's Correlation:\n")
+  
+  # Function WITHOUT conditional: always scientific notation
+  fmt_p <- function(p) {
+    if (is.na(p)) return("NA")
+    return(format(p, scientific = TRUE, digits = 4))
+  }
+  
+  cat(sprintf("  rho = %.4f, p = %s\n", 
+              cor_spearman$estimate, 
+              fmt_p(cor_spearman$p.value)))
+  
+  cat("\nLinear Regression Model:\n")
+  cat(sprintf("  phi = %.4f - %.4f alpha\n", intercept, abs(slope)))
+  cat(sprintf("  R² = %.4f\n", model_summary$r.squared))
+  cat(sprintf("  Adjusted R² = %.4f\n", model_summary$adj.r.squared))
+  cat(sprintf("  F(%d,%d) = %.2f, p = %s\n", 
+              model_anova$Df[1], 
+              model_anova$Df[2],
+              model_anova$`F value`[1],
+              fmt_p(model_anova$`Pr(>F)`[1])))
+  sink()
+  
+} else {
+  cat("Not enough species with complete data for regression analysis.\n")
+}
+
+# ------------------------------------------------------------------------
+# 7. OPEN/CLOSED CLASSIFICATION
+# ------------------------------------------------------------------------
+results$metrics$pangenome_type <- ifelse(results$metrics$alpha < 1, "Open", "Closed")
+write.csv(results$metrics, 
+          file.path(base_dir, "pangenome_analysis_final.csv"), 
+          row.names = FALSE)
+
+pangenome_summary <- results$metrics %>%
+  group_by(pangenome_type) %>%
+  summarise(
+    n_species = n(),
+    mean_pan_size = mean(pan_total, na.rm = TRUE),
+    mean_core = mean(core, na.rm = TRUE),
+    mean_fluidity = mean(fluidity_mean, na.rm = TRUE)
+  )
+print(pangenome_summary)
+
+cat("\nProcess completed! Gene family files are in:\n")
+cat("  - Per species: inside each folder, file 'species_gene_families.csv'\n")
+cat("  - General: ", file.path(base_dir, "all_species_gene_families.csv"), "\n")
