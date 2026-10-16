@@ -1,0 +1,84 @@
+#!/bin/bash
+
+# Archivo que contiene la lista de accesiones
+archivo_lista="brady_spp_GCF.txt"
+
+# Directorio donde guardar las descargas
+directorio_descargas="descargas_genomas"
+mkdir -p "$directorio_descargas"
+
+# Número máximo de reintentos por descarga
+MAX_RETRY=7
+
+# Archivo de log
+LOG="descargas_error.log"
+> "$LOG"   # limpiar log previo
+
+echo "=== Iniciando descargas robustas ==="
+
+# Función para verificar si el ZIP está íntegro
+verificar_zip() {
+    unzip -t "$1" >/dev/null 2>&1
+    return $?
+}
+
+# Recorrer lista
+while IFS= read -r acc || [[ -n "$acc" ]]; do
+    archivo_zip="$directorio_descargas/$acc.zip"
+
+    echo "-----------------------------------------"
+    echo "Procesando: $acc"
+
+    # Si ya existe un archivo previamente descargado, verificar si es válido
+    if [[ -f "$archivo_zip" ]]; then
+        if verificar_zip "$archivo_zip"; then
+            echo "[OK] Archivo ya válido: $archivo_zip — se omite descarga."
+            continue
+        else
+            echo "[!] Archivo existente corrupto, re-descargando..."
+            rm -f "$archivo_zip"
+        fi
+    fi
+
+    # Intentar descarga con reintentos
+    intento=1
+    while [[ $intento -le $MAX_RETRY ]]; do
+        echo "Intento $intento de $MAX_RETRY..."
+
+        datasets download genome accession "$acc" --filename "$archivo_zip"
+
+        # Verificar si descarga fue exitosa
+        if [[ $? -eq 0 ]]; then
+            # Comprobar integridad del ZIP
+            if verificar_zip "$archivo_zip"; then
+                echo "[OK] Descargado correctamente: $archivo_zip"
+                break
+            else
+                echo "[!] Descarga corrupta. Reintentando..."
+                rm -f "$archivo_zip"
+            fi
+        else
+            echo "[!] Falló la descarga. Reintentando..."
+        fi
+
+        intento=$((intento+1))
+        sleep 3  # pequeño descanso entre intentos
+    done
+
+    # Si falló tras todos los intentos
+    if [[ $intento -gt $MAX_RETRY ]]; then
+        echo "[ERROR] No se pudo descargar $acc después de $MAX_RETRY intentos."
+        echo "$acc" >> "$LOG"
+    fi
+
+done < "$archivo_lista"
+
+echo "========================================="
+echo "Descargas completadas."
+echo "Archivos descargados en: $directorio_descargas"
+
+if [[ -s "$LOG" ]]; then
+    echo "Algunos accesiones fallaron. Revisar: $LOG"
+else
+    echo "Todas las descargas completadas sin fallos."
+fi
