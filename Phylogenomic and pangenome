@@ -439,7 +439,7 @@ library(broom)
 # ------------------------------------------------------------------------
 # 1. CONFIGURATION
 # ------------------------------------------------------------------------
-base_dir <- "/media/mordor/hector/brady_spp/13_pangenoma_NOVO"
+base_dir <- "/13_pangenoma_NOVO"
 
 # Find all gene_presence_absence.csv files (recursive)
 files <- list.files(
