@@ -1,0 +1,1082 @@
+# COG annotation and analysis 
+
+#!/bin/bash
+
+DATA_DIR="/db/eggNOG_v5/eggnopv5/db"
+CPU=35
+BASE_DIR="/13_pangenoma_NOVO"
+
+cd "$BASE_DIR" || exit 1
+
+for dir in B_*; do
+
+    # Check that it is a directory
+    [ -d "$dir" ] || continue
+
+    INPUT="$dir/pan_genome_reference.faa"
+
+    # Check that the file exists
+    if [ ! -f "$INPUT" ]; then
+        echo "Does not exist: $INPUT"
+        continue
+    fi
+
+    echo "========================================="
+    echo "Processing: $dir"
+    echo "========================================="
+
+    emapper.py \
+        -i "$INPUT" \
+        --output "${dir}_eggnog" \
+        --output_dir "$dir" \
+        --data_dir "$DATA_DIR" \
+        --cpu "$CPU"
+
+    echo
+done
+
+echo "========================================="
+echo "All species have been processed."
+echo "========================================="
+
+
+# Anaçysis COG X specie 
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+COG ENRICHMENT ANALYSIS — IMPROVED AND CORRECTED VERSION (Option A)
+================================================================================
+
+Fixes included:
+  1. FIX prefix matching: each eggNOG query is assigned to ONE SINGLE cluster
+     (the most specific = the longest). Avoids double counting.
+  2. FIX primary_cog(): now filters 'S' before taking the first letter.
+       - "SE" -> 'E'  (before: 'S' — silent loss)
+       - "SG" -> 'G'
+       - "S"  -> 'S'  (correct fallback)
+       - "ES" -> 'E'
+  3. Haldane-Anscombe (+0.5 to the 4 cells) ONLY if any cell is 0.
+  4. General table with a,b,c,d + marginals + p_fisher + Bonferroni + BH.
+  5. Cross-species summary (mean/median LOR, n_species sig., frac_sig).
+  6. Heatmap with asterisks for significant cells (Bonferroni).
+  7. Final console block with Method / Species / COGs / Tests / Threshold.
+  8. Audit: cluster_COG_assignment.csv.
+  9. Fisher error counter (traceability).
+ 10. Counter diagnostic of "S*" annotations at the beginning of the log.
+
+Modes:
+  - USE_PRIMARY_COG_ONLY = False -> multi-COG per family (default)
+  - USE_PRIMARY_COG_ONLY = True  -> 1 primary COG/family (with Option A fix)
+================================================================================
+"""
+
+import os
+import sys
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import Counter
+from scipy.stats import fisher_exact
+from statsmodels.stats.multitest import multipletests
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+BASE_DIR            = "/media/mordor/hector/brady_spp/13_pangenoma_NOVO"
+GENE_FAMILIES_FILE  = os.path.join(BASE_DIR, "all_species_gene_families.csv")
+OUTPUT_DIR          = os.path.join(BASE_DIR, "Results_eggnop-mapper")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+ALPHA       = 0.05
+CATEGORIES  = ['core', 'shell', 'cloud']
+
+# --- Analysis modes ----------------------------------------------------------
+USE_PRIMARY_COG_ONLY      = False   # False = multi-COG per family
+EXCLUDE_S_FROM_ENRICHMENT = True    # 'S' is not tested as enriched COG
+
+# 20 standard bacterial categories (reference only)
+COGS_20 = list('CDEFGHIJKLMNOPQRSTUV')
+
+
+# =============================================================================
+# COG DICTIONARY
+# =============================================================================
+COG_DESCRIPTIONS = {
+    'A': 'RNA processing and modification',
+    'B': 'Chromatin structure and dynamics',
+    'C': 'Energy production and conversion',
+    'D': 'Cell cycle control, cell division, chromosome partitioning',
+    'E': 'Amino acid transport and metabolism',
+    'F': 'Nucleotide transport and metabolism',
+    'G': 'Carbohydrate transport and metabolism',
+    'H': 'Coenzyme transport and metabolism',
+    'I': 'Lipid transport and metabolism',
+    'J': 'Translation, ribosomal structure and biogenesis',
+    'K': 'Transcription',
+    'L': 'Replication, recombination and repair',
+    'M': 'Cell wall/membrane/envelope biogenesis',
+    'N': 'Cell motility',
+    'O': 'Posttranslational modification, protein turnover, chaperones',
+    'P': 'Inorganic ion transport and metabolism',
+    'Q': 'Secondary metabolites biosynthesis, transport and catabolism',
+    'R': 'General function prediction only',
+    'S': 'Function unknown',
+    'T': 'Signal transduction mechanisms',
+    'U': 'Intracellular trafficking, secretion, and vesicular transport',
+    'V': 'Defense mechanisms',
+    'W': 'Extracellular structures',
+    'Y': 'Nuclear structure',
+    'Z': 'Cytoskeleton',
+}
+
+ALL_COG_LETTERS  = sorted([c for c in COG_DESCRIPTIONS if c != 'S'])
+COG_LETTERS_PLOT = sorted(COG_DESCRIPTIONS.keys())
+
+FISHER_ERROR_COUNT = 0
+
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+def parse_eggnog(eggnog_path):
+    """
+    Read eggNOG-mapper file and return {query: COG string}.
+    Column 7 (index 6) contains the COG letters.
+    Null values or '-' -> 'S'.
+    """
+    if not os.path.exists(eggnog_path):
+        return {}
+    try:
+        df = pd.read_csv(eggnog_path, sep='\t', header=None, comment='#',
+                         dtype=str, na_values=['-', '', 'NaN'])
+        if df.empty:
+            return {}
+        if df.shape[1] < 7:
+            print(f"  Warning: {eggnog_path} has <7 columns. Assigning 'S'.",
+                  file=sys.stderr)
+            return {row[0]: 'S' for row in df.values}
+        queries = df.iloc[:, 0].values
+        cogs    = df.iloc[:, 6].values
+        cogs    = ['S' if (pd.isna(x) or x == '-') else str(x).strip() for x in cogs]
+        return dict(zip(queries, cogs))
+    except Exception as e:
+        print(f"Error reading {eggnog_path}: {e}", file=sys.stderr)
+        return {}
+
+
+def split_cog(cog_str):
+    """
+    'CE' -> ['C','E'] (only valid letters from dictionary).
+    Empty -> ['S'].
+    """
+    if pd.isna(cog_str) or cog_str == '':
+        return ['S']
+    valid = [ch for ch in str(cog_str).strip() if ch in COG_DESCRIPTIONS]
+    return valid if valid else ['S']
+
+
+def primary_cog(cog_str):
+    """
+    OPTION A — Returns the first FUNCTIONAL COG letter (≠ 'S') if it exists.
+
+      "SE" -> 'E'      (before fix: 'S' -> silent loss)
+      "SG" -> 'G'
+      "ES" -> 'E'
+      "S"  -> 'S'      (correct fallback: no functional letter)
+      "SX" -> 'S'      ('X' is not in COG_DESCRIPTIONS)
+      ""   -> 'S'
+
+    This is consistent with the external loop filter, which already discards
+    cog_str == 'S' exactly. If a family has "SE", it means it has
+    a real functional annotation ('E') and should not fall back to 'S'.
+    """
+    letters = [c for c in split_cog(cog_str) if c != 'S']
+    return letters[0] if letters else 'S'
+
+
+def build_cluster_to_queries(mapping, clusters_sp):
+    """
+    FIX FOR PREFIX MATCHING.
+
+    Assigns each eggNOG query to EXACTLY ONE cluster:
+    the most specific (= the longest) that matches.
+
+    Avoids double counting when one cluster is a prefix of another:
+      cluster "gene_1"   -> query "gene_1_2_3" matches
+      cluster "gene_1_2" -> query "gene_1_2_3" matches
+      With this function the query is assigned ONLY to cluster "gene_1_2".
+    """
+    clusters_sorted = sorted(clusters_sp, key=len, reverse=True)
+    c2q = {c: [] for c in clusters_sp}
+    for query in mapping:
+        for cluster in clusters_sorted:
+            if query == cluster or query.startswith(cluster + '_'):
+                c2q[cluster].append(query)
+                break   # <-- do NOT keep searching
+    return c2q
+
+
+# =============================================================================
+# STATISTICAL FUNCTION
+# =============================================================================
+def fisher_log2_or(a, b, c, d):
+    """
+    Returns (log2OR, p_fisher).
+
+    - If any marginal = 0 -> (NaN, NaN)  (OR not defined).
+    - p_fisher: Fisher exact two-sided on the ORIGINAL table.
+    - log2OR  : Haldane-Anscombe (+0.5 to the 4 cells) ONLY if any cell = 0.
+    - Final clipping of log2OR to [-10, 10] for graphical stability.
+    """
+    global FISHER_ERROR_COUNT
+    a, b, c, d = int(a), int(b), int(c), int(d)
+
+    # 1) Degenerate table -> NaN
+    if (a + b) == 0 or (c + d) == 0 or (a + c) == 0 or (b + d) == 0:
+        return np.nan, np.nan
+
+    # 2) p-value on the original table
+    try:
+        _, p = fisher_exact([[a, b], [c, d]], alternative='two-sided')
+        p = float(p)
+        if not np.isfinite(p):
+            p = 1.0
+    except Exception as e:
+        FISHER_ERROR_COUNT += 1
+        print(f"⚠️ Fisher failed for table [[{a},{b}],[{c},{d}]]: {e}",
+              file=sys.stderr)
+        return np.nan, np.nan
+
+    # 3) log2(OR) with Haldane-Anscombe ONLY if there are zeros
+    if min(a, b, c, d) == 0:
+        a2, b2, c2, d2 = a + 0.5, b + 0.5, c + 0.5, d + 0.5
+    else:
+        a2, b2, c2, d2 = float(a), float(b), float(c), float(d)
+
+    log2or = float(np.log2((a2 * d2) / (b2 * c2)))
+    log2or = float(np.clip(log2or, -10.0, 10.0))
+
+    return log2or, p
+
+
+# =============================================================================
+# DATA LOADING
+# =============================================================================
+print("=" * 78)
+print(" Loading gene families...")
+df_fam = pd.read_csv(GENE_FAMILIES_FILE)
+df_fam = df_fam.drop_duplicates(subset=['species', 'cluster'])
+print(f"Records: {len(df_fam)}")
+species_list = sorted(df_fam['species'].unique())
+print(f"Species ({len(species_list)}): {species_list}")
+
+
+# =============================================================================
+# COG MAPPING FROM eggNOG (per species)
+# =============================================================================
+print("\nParsing eggNOG files...")
+species_mappings = {}
+for sp in species_list:
+    f = os.path.join(BASE_DIR, sp, f"{sp}_eggnog.emapper.annotations")
+    species_mappings[sp] = parse_eggnog(f)
+    print(f"  {sp}: {len(species_mappings[sp])} annotations")
+
+
+# =============================================================================
+# DIAGNOSTIC: annotations starting with 'S' but with functional letters
+# =============================================================================
+print("\n" + "=" * 78)
+print(" DIAGNOSTIC — 'S*' annotations with additional functional letters")
+print("=" * 78)
+
+s_prefixed = Counter()
+s_only_with_extra = Counter()   # "SE", "SG", ...
+s_total = 0
+for sp, mapping in species_mappings.items():
+    for cog_str in mapping.values():
+        if pd.isna(cog_str):
+            continue
+        cs = str(cog_str).strip()
+        if cs == 'S':
+            s_total += 1
+        elif cs.startswith('S') and cs not in ['-', '']:
+            s_prefixed[cs] += 1
+
+print(f"Total annotations exactly 'S': {s_total}")
+print(f"'S*' annotations with additional letters: {sum(s_prefixed.values())}")
+if s_prefixed:
+    print("Top 20 'S*' patterns found:")
+    for k, v in s_prefixed.most_common(20):
+        # Does it have any functional letter (≠ 'S')?
+        extras = [c for c in k if c in COG_DESCRIPTIONS and c != 'S']
+        tag = f"-> corrected primary: '{extras[0]}'" if extras else "-> only 'S'"
+        print(f"    {k:<8} {v:>6}   {tag}")
+else:
+    print("No annotations of type 'SE', 'SG', etc. were found.")
+print("=" * 78)
+print()
+
+
+# =============================================================================
+# COG ASSIGNMENT PER (SPECIES, CLUSTER) — NO DOUBLE COUNTING
+# =============================================================================
+print("Assigning COG to each species-cluster combination...")
+
+species_cluster_cogs = {sp: {} for sp in species_list}
+
+for sp in species_list:
+    mapping = species_mappings.get(sp, {})
+    if not mapping:
+        continue
+
+    clusters_sp = set(df_fam[df_fam['species'] == sp]['cluster'])
+    c2q = build_cluster_to_queries(mapping, clusters_sp)
+
+    for cluster in clusters_sp:
+        letters = []
+        for query in c2q[cluster]:
+            cog_str = mapping[query]
+            if cog_str and cog_str not in ['-', 'S'] and not pd.isna(cog_str):
+                if USE_PRIMARY_COG_ONLY:
+                    letters.append(primary_cog(cog_str))   # <-- Option A
+                else:
+                    letters.extend(split_cog(cog_str))
+        if not letters:
+            letters = ['S']
+        species_cluster_cogs[sp][cluster] = sorted(set(letters))
+
+
+def get_cog_letters(row):
+    return species_cluster_cogs.get(row['species'], {}).get(row['cluster'], ['S'])
+
+
+df_fam['COG_letters'] = df_fam.apply(get_cog_letters, axis=1)
+
+# Audit: one row per cluster with its assigned COGs
+audit_rows = []
+for _, r in df_fam.iterrows():
+    audit_rows.append({
+        'species':     r['species'],
+        'cluster':     r['cluster'],
+        'category':    r['category'],
+        'COG_letters': ';'.join(r['COG_letters']),
+        'n_COGs':      len(r['COG_letters']),
+    })
+pd.DataFrame(audit_rows).to_csv(
+    os.path.join(OUTPUT_DIR, "cluster_COG_assignment.csv"), index=False
+)
+
+# Expand: one row per COG letter
+df_expanded = df_fam.explode('COG_letters', ignore_index=True)
+df_expanded.rename(columns={'COG_letters': 'COG'}, inplace=True)
+df_expanded.to_csv(
+    os.path.join(OUTPUT_DIR, "gene_families_expanded_COG.csv"), index=False
+)
+print(f"Expanded dataframe: {len(df_expanded)} rows")
+
+
+# =============================================================================
+# DETAILED STATISTICAL SUMMARY
+# =============================================================================
+print("\nGenerating detailed statistical summary...")
+
+df_fam['has_nonS'] = df_fam['COG_letters'].apply(lambda x: any(l != 'S' for l in x))
+
+W = 78
+def sep(ch='='): return ch * W
+
+summary_lines = []
+
+summary_lines.append(sep())
+summary_lines.append(" SUMMARY STATISTICS — COG ENRICHMENT".center(W))
+summary_lines.append(sep())
+summary_lines.append(f" Date:               {pd.Timestamp.now():%Y-%m-%d %H:%M:%S}")
+summary_lines.append(f" Output directory:   {OUTPUT_DIR}")
+summary_lines.append(f" COG mode:           "
+                     f"{'PRIMARY (1 COG/family, Option A)' if USE_PRIMARY_COG_ONLY else 'MULTI-COG per family'}")
+summary_lines.append(f" Exclude 'S':        {EXCLUDE_S_FROM_ENRICHMENT}")
+summary_lines.append(f" 'S*' annotations with functional letters: "
+                     f"{sum(s_prefixed.values())}")
+summary_lines.append("")
+
+summary_lines.append(sep('-'))
+summary_lines.append(" 1. GLOBAL")
+summary_lines.append(sep('-'))
+global_total   = len(df_fam)
+global_with    = int(df_fam['has_nonS'].sum())
+global_without = global_total - global_with
+summary_lines.append(f" Total families (species-cluster): {global_total}")
+summary_lines.append(f"   With annotation (≥1 COG ≠ S):    {global_with}")
+summary_lines.append(f"   Without annotation (only S):     {global_without}")
+summary_lines.append("")
+
+for cat in CATEGORIES:
+    cdf = df_fam[df_fam['category'] == cat]
+    c_with = int(cdf['has_nonS'].sum())
+    summary_lines.append(f" {cat.upper():<6} Total={len(cdf):>6}  "
+                         f"Annotated={c_with:>6}  Unannotated={len(cdf)-c_with:>6}")
+summary_lines.append("")
+
+summary_lines.append(sep('-'))
+summary_lines.append(" 2. BY SPECIES")
+summary_lines.append(sep('-'))
+hdr = (f" {'species':<40} {'total':>7} {'annot':>7} {'unannot':>7} "
+       f"{'core_id':>8} {'shell_id':>9} {'cloud_id':>9}")
+summary_lines.append(hdr)
+summary_lines.append("-" * len(hdr))
+for sp in species_list:
+    sdf      = df_fam[df_fam['species'] == sp]
+    sp_total = len(sdf)
+    sp_with  = int(sdf['has_nonS'].sum())
+    core_id  = int(((sdf['category'] == 'core')  & sdf['has_nonS']).sum())
+    shell_id = int(((sdf['category'] == 'shell') & sdf['has_nonS']).sum())
+    cloud_id = int(((sdf['category'] == 'cloud') & sdf['has_nonS']).sum())
+    summary_lines.append(f" {sp:<40} {sp_total:>7} {sp_with:>7} "
+                         f"{sp_total-sp_with:>7} {core_id:>8} "
+                         f"{shell_id:>9} {cloud_id:>9}")
+summary_lines.append("")
+
+
+# =============================================================================
+# FIGURE 3A: PANGENOME COMPOSITION
+# =============================================================================
+print("\nGenerating Figure 3A...")
+counts = df_fam.groupby(['species', 'category']).size().unstack(fill_value=0)
+for cat in CATEGORIES:
+    if cat not in counts.columns:
+        counts[cat] = 0
+counts = counts[CATEGORIES]
+counts.to_csv(os.path.join(OUTPUT_DIR, "pangenome_composition.csv"))
+
+ax = counts.plot(kind='bar', figsize=(14, 6), width=0.8,
+                 color=['#2ca02c', '#ff7f0e', '#1f77b4'])
+ax.set_title('Pangenome composition by species (Figure 3A)', fontsize=14)
+ax.set_xlabel('Species')
+ax.set_ylabel('Number of gene families')
+ax.legend(['Core', 'Shell (accessory)', 'Cloud (unique)'])
+plt.xticks(rotation=45, ha='right')
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, 'fig3a_pangenome_composition.png'), dpi=300)
+plt.close()
+
+
+# =============================================================================
+# FIGURE 3C: COG ENRICHMENT
+# =============================================================================
+print("\nGenerating Figure 3C (COG enrichment)...")
+
+cogs_for_enrich = sorted(set(df_expanded['COG']))
+if EXCLUDE_S_FROM_ENRICHMENT:
+    cogs_for_enrich = [c for c in cogs_for_enrich if c != 'S']
+print(f"COGs analyzed: {len(cogs_for_enrich)} -> {cogs_for_enrich}")
+
+n_tests        = 0
+bonf_threshold = np.nan
+df_enrich      = None
+cross          = None
+
+if cogs_for_enrich:
+    enrichment_results = []
+    for sp in species_list:
+        sp_df        = df_fam[df_fam['species'] == sp]
+        all_clusters = set(sp_df['cluster'])
+        n_total      = len(all_clusters)
+
+        # Precompute clusters with each COG
+        cog_clusters = {}
+        for cog in cogs_for_enrich:
+            cog_clusters[cog] = set(
+                df_expanded[(df_expanded['species'] == sp) &
+                            (df_expanded['COG'] == cog)]['cluster']
+            )
+
+        for cog in cogs_for_enrich:
+            for cat in CATEGORIES:
+                cat_clusters    = set(sp_df.loc[sp_df['category'] == cat, 'cluster'])
+                noncat_clusters = all_clusters - cat_clusters
+
+                a = len(cat_clusters & cog_clusters[cog])
+                b = len(cat_clusters) - a
+                c = len(noncat_clusters & cog_clusters[cog])
+                d = len(noncat_clusters) - c
+
+                log2_or, p = fisher_log2_or(a, b, c, d)
+
+                enrichment_results.append({
+                    'species':       sp,
+                    'COG':           cog,
+                    'category':      cat,
+                    'a':             a,
+                    'b':             b,
+                    'c':             c,
+                    'd':             d,
+                    'n_category':    a + b,
+                    'n_noncategory': c + d,
+                    'n_COG_total':   a + c,
+                    'n_total':       n_total,
+                    'log2OR':        log2_or,
+                    'p_fisher':      p,
+                })
+
+    df_enrich      = pd.DataFrame(enrichment_results)
+    n_tests        = len(df_enrich)
+    bonf_threshold = ALPHA / n_tests
+    print(f"Tests: {n_tests}   Bonferroni threshold: {bonf_threshold:.3e}")
+
+    # --- Multiple adjustments (Bonferroni + BH), excluding NaN ---
+    valid_mask = df_enrich['p_fisher'].notna()
+    pv         = df_enrich.loc[valid_mask, 'p_fisher'].values
+
+    p_bonf_all = np.full(len(df_enrich), np.nan)
+    p_bh_all   = np.full(len(df_enrich), np.nan)
+
+    if len(pv) > 0:
+        p_bonf_all[valid_mask] = np.minimum(pv * n_tests, 1.0)
+        _, p_bh_v, _, _ = multipletests(pv, method='fdr_bh')
+        p_bh_all[valid_mask] = p_bh_v
+
+    df_enrich['p_adj_Bonf']     = p_bonf_all
+    df_enrich['significant']    = df_enrich['p_fisher'] < bonf_threshold
+    df_enrich['p_adj_BH']       = p_bh_all
+    df_enrich['significant_BH'] = df_enrich['p_adj_BH'] < ALPHA
+
+    df_enrich = df_enrich[[
+        'species', 'COG', 'category',
+        'a', 'b', 'c', 'd',
+        'n_category', 'n_noncategory', 'n_COG_total', 'n_total',
+        'log2OR', 'p_fisher',
+        'p_adj_Bonf', 'significant',
+        'p_adj_BH',   'significant_BH'
+    ]]
+
+    out_stats = os.path.join(OUTPUT_DIR, "COG_enrichment_all_categories_with_adj.csv")
+    df_enrich.to_csv(out_stats, index=False)
+    print(f"General table saved: {out_stats}")
+
+    n_sig_bonf = int(df_enrich['significant'].sum())
+    n_sig_bh   = int(df_enrich['significant_BH'].sum())
+    print(f"Significant Bonferroni: {n_sig_bonf}")
+    print(f"Significant BH (ref.):  {n_sig_bh}")
+
+    # --- Cross-species summary ---
+    cross = df_enrich.groupby(['COG', 'category']).agg(
+        n_species_measured=('log2OR', 'count'),
+        mean_LOR=('log2OR', 'mean'),
+        median_LOR=('log2OR', 'median'),
+        sd_LOR=('log2OR', 'std'),
+        n_sig_Bonf=('significant', 'sum'),
+        n_sig_BH=('significant_BH', 'sum'),
+    ).reset_index()
+    cross['frac_sig_Bonf'] = cross['n_sig_Bonf'] / cross['n_species_measured']
+    cross['frac_sig_BH']   = cross['n_sig_BH']   / cross['n_species_measured']
+    cross['abs_mean_LOR']  = cross['mean_LOR'].abs()
+    cross.to_csv(
+        os.path.join(OUTPUT_DIR, "COG_enrichment_cross_species_summary.csv"),
+        index=False
+    )
+
+    # --- Heatmap with asterisks ---
+    print("Generating heatmap...")
+    fig, axes = plt.subplots(1, len(CATEGORIES),
+                             figsize=(8 * len(CATEGORIES), 8),
+                             sharey=True)
+    if len(CATEGORIES) == 1:
+        axes = [axes]
+
+    all_vals = df_enrich['log2OR'].dropna().values
+    if len(all_vals) > 0:
+        vmax = max(np.percentile(np.abs(all_vals), 95), 1.0)
+    else:
+        vmax = 5.0
+    vmin = -vmax
+
+    for idx, cat in enumerate(CATEGORIES):
+        sub     = df_enrich[df_enrich['category'] == cat]
+        piv_lor = sub.pivot(index='species', columns='COG', values='log2OR')
+        piv_sig = sub.pivot(index='species', columns='COG', values='significant')
+        piv_lor = piv_lor.reindex(columns=ALL_COG_LETTERS)
+        piv_sig = piv_sig.reindex(columns=ALL_COG_LETTERS, fill_value=False)
+
+        mask   = piv_lor.isna()
+        filled = piv_lor.fillna(0)
+
+        if idx == 0:
+            order = filled.mean(axis=0).sort_values(ascending=False).index
+        filled  = filled[order]
+        piv_sig = piv_sig[order]
+        mask    = mask[order]
+
+        sns.heatmap(filled, ax=axes[idx], cmap='RdBu_r', center=0,
+                    cbar_kws={'label': 'log2 odds ratio'},
+                    linewidths=0.5, vmin=vmin, vmax=vmax, mask=mask)
+
+        for i in range(piv_sig.shape[0]):
+            for j in range(piv_sig.shape[1]):
+                if piv_sig.iloc[i, j]:
+                    axes[idx].text(j + 0.5, i + 0.5, '*', ha='center',
+                                   va='center', fontsize=11,
+                                   fontweight='bold')
+
+        axes[idx].set_title(f'{cat.capitalize()} enrichment', fontsize=14)
+        axes[idx].set_xlabel('COG category')
+        axes[idx].set_ylabel('Species' if idx == 0 else '')
+        labels = [f"{c}: {COG_DESCRIPTIONS.get(c, '')[:20]}"
+                  for c in filled.columns]
+        axes[idx].set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+
+    fig.suptitle(
+        f"COG enrichment (* = Fisher p < {bonf_threshold:.1e}, "
+        f"Bonferroni FWER < {ALPHA})", y=1.02
+    )
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, 'fig3c_enrichment_three_categories.png'),
+                dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Figure 3C saved (color range ±{vmax:.2f}).")
+
+    # --- Section 3 in summary ---
+    summary_lines.append(sep('-'))
+    summary_lines.append(" 3. COG ENRICHMENT")
+    summary_lines.append(sep('-'))
+    summary_lines.append(f" Total tests:                 {n_tests}")
+    summary_lines.append(f" Bonferroni threshold:        {bonf_threshold:.3e}")
+    summary_lines.append(f" Significant Bonferroni:      {n_sig_bonf}")
+    summary_lines.append(f" Significant BH (ref.):       {n_sig_bh}")
+    summary_lines.append("")
+    summary_lines.append(" Top 15 cross-species signals (by |mean LOR|):")
+    top15 = cross.sort_values('abs_mean_LOR', ascending=False).head(15)
+    hdr = (f" {'COG':<4} {'category':<8} {'mean_LOR':>10} "
+           f"{'n_sp':>5} {'n_sig':>6} {'frac_sig':>10}")
+    summary_lines.append(hdr)
+    summary_lines.append("-" * len(hdr))
+    for _, r in top15.iterrows():
+        ml   = r['mean_LOR']
+        ml_s = f"{ml:>10.3f}" if pd.notna(ml) else f"{'NA':>10}"
+        summary_lines.append(
+            f" {r['COG']:<4} {r['category']:<8} {ml_s} "
+            f"{int(r['n_species_measured']):>5} "
+            f"{int(r['n_sig_Bonf']):>6} {r['frac_sig_Bonf']:>10.3f}"
+        )
+    summary_lines.append("")
+else:
+    print("WARNING: no valid COGs. Figure 3C was not generated.")
+
+
+# =============================================================================
+# FIGURE 4: COG BARS PER SPECIES
+# =============================================================================
+print("\nGenerating Figure 4 (COG distribution per species)...")
+
+species_cog_counts = {}
+for sp in species_list:
+    sp_exp = df_expanded[df_expanded['species'] == sp]
+    counts_dict = {cog: {'core': 0, 'shell': 0, 'cloud': 0}
+                   for cog in COG_LETTERS_PLOT}
+    for _, row in sp_exp.iterrows():
+        cog, cat = row['COG'], row['category']
+        if cog in counts_dict and cat in counts_dict[cog]:
+            counts_dict[cog][cat] += 1
+
+    cdf = pd.DataFrame(counts_dict).T
+    for cat in CATEGORIES:
+        if cat not in cdf.columns:
+            cdf[cat] = 0
+    cdf = cdf[CATEGORIES].reindex(COG_LETTERS_PLOT, fill_value=0)
+    species_cog_counts[sp] = cdf
+
+    out = cdf.reset_index().rename(columns={'index': 'COG'})
+    out['Description'] = out['COG'].map(COG_DESCRIPTIONS)
+    out.to_csv(os.path.join(OUTPUT_DIR, f"COG_counts_{sp}.csv"), index=False)
+
+n_species = len(species_list)
+ncols     = min(4, n_species)
+nrows     = int(np.ceil(n_species / ncols))
+
+fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows),
+                         squeeze=False)
+fig.suptitle('COG category distribution per species', fontsize=14, y=1.02)
+
+n_cogs       = len(COG_LETTERS_PLOT) - 1
+base_colors  = sns.color_palette("tab20", n_cogs)
+cog_color_dict = {}
+ci = 0
+for cog in COG_LETTERS_PLOT:
+    if cog == 'S':
+        cog_color_dict[cog] = '#b0b0b0'
+    else:
+        cog_color_dict[cog] = base_colors[ci]
+        ci += 1
+
+for idx, sp in enumerate(species_list):
+    row, col = idx // ncols, idx % ncols
+    ax = axes[row, col]
+    cdf = species_cog_counts[sp]
+    ctp = cdf[(cdf[CATEGORIES] > 0).any(axis=1)]
+    if ctp.empty:
+        ax.text(0.5, 0.5, 'No COG data', ha='center', va='center',
+                transform=ax.transAxes)
+        ax.set_title(sp)
+        continue
+
+    x = np.arange(len(CATEGORIES))
+    bottom = np.zeros(len(CATEGORIES))
+    for cog in ctp.index:
+        vals = ctp.loc[cog, CATEGORIES].values
+        ax.bar(x, vals, bottom=bottom, label=cog,
+               color=cog_color_dict.get(cog, 'gray'))
+        bottom += vals
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(CATEGORIES)
+    ax.set_ylabel('COG assignments')
+    ax.set_title(sp)
+
+for idx in range(len(species_list), nrows * ncols):
+    axes[idx // ncols, idx % ncols].axis('off')
+
+handles, labels = [], []
+for ax in axes.flatten():
+    if ax.has_data():
+        h, l = ax.get_legend_handles_labels()
+        if h:
+            handles, labels = h, l
+            break
+if handles:
+    fig.legend(handles, labels, loc='center right',
+               bbox_to_anchor=(1.0, 0.5), fontsize=8, title="COG category")
+
+plt.tight_layout(rect=[0, 0, 0.92, 1])
+plt.savefig(os.path.join(OUTPUT_DIR, 'fig4_COG_bars_per_species.png'), dpi=300)
+plt.close()
+print("Figure 4 saved.")
+
+
+# =============================================================================
+# SUMMARY TXT
+# =============================================================================
+header_lines = [
+    sep(),
+    " COG ENRICHMENT — STATISTICS SUMMARY".center(W),
+    sep(),
+    f" Date:               {pd.Timestamp.now():%Y-%m-%d %H:%M:%S}",
+    f" Output directory:   {OUTPUT_DIR}",
+    f" Method:             Fisher exact (two-sided) + log2(OR)",
+    f" Multiple adjustment: Bonferroni FWER < {ALPHA} (+ BH as reference)",
+    f" Haldane-Anscombe:   +0.5 only if any cell = 0",
+    f" COG mode:           "
+    f"{'PRIMARY (1 COG/family, Option A)' if USE_PRIMARY_COG_ONLY else 'MULTI-COG per family'}",
+    f" Exclude 'S':        {EXCLUDE_S_FROM_ENRICHMENT}",
+    f" Fix primary_cog:    yes ('SE' -> 'E', not 'S')",
+    f" Fix prefix match:   yes (query -> 1 single cluster, the most specific)",
+    f" 'S*' annotations with functional letters: {sum(s_prefixed.values())}",
+    "",
+]
+summary_lines = header_lines + summary_lines
+
+summary_lines.append(sep('-'))
+summary_lines.append(" 4. GENERATED FILES")
+summary_lines.append(sep('-'))
+for f in sorted(os.listdir(OUTPUT_DIR)):
+    summary_lines.append(f"   - {f}")
+summary_lines.append("")
+summary_lines.append(sep())
+
+with open(os.path.join(OUTPUT_DIR, "summary_statistics.txt"),
+          "w", encoding="utf-8") as fh:
+    fh.write("\n".join(summary_lines) + "\n")
+
+
+# =============================================================================
+# FINAL CONSOLE REPORT
+# =============================================================================
+print("\n" + "=" * 78)
+print(" ANALYSIS COMPLETED")
+print("=" * 78)
+
+print(f"\nMethod:      Fisher exact + log2(OR), Bonferroni FWER < {ALPHA}")
+print(f"COG mode:    {'PRIMARY (1 COG/family, Option A)' if USE_PRIMARY_COG_ONLY else 'MULTI-COG per family'}")
+print(f"Exclude S:   {EXCLUDE_S_FROM_ENRICHMENT}")
+print(f"Fix 'SE'->'E' active: {'yes' if USE_PRIMARY_COG_ONLY else 'N/A (multi-COG mode)'}")
+print()
+print(f"Species:     {len(species_list)}")
+print(f"COGs:        {len(cogs_for_enrich)}")
+print(f"Categories:  {len(CATEGORIES)} (core / shell / cloud)")
+
+if n_tests > 0:
+    print(f"Tests:       {n_tests}")
+    print(f"Threshold:   {bonf_threshold:.3e}")
+    print()
+    print(f"Significant Bonferroni: {int(df_enrich['significant'].sum())} / {n_tests}")
+    print(f"Significant BH (ref.):  {int(df_enrich['significant_BH'].sum())} / {n_tests}")
+
+print()
+print(f"'S*' annotations with functional letters (affected by the fix): "
+      f"{sum(s_prefixed.values())}")
+print(f"Fisher errors:  {FISHER_ERROR_COUNT}")
+print(f"Results in:     {OUTPUT_DIR}")
+print("=" * 78)
+for f in sorted(os.listdir(OUTPUT_DIR)):
+    print(f"  - {f}")
+print()
+
+
+# Filtering Relevant Files 
+
+#!/usr/bin/env python3
+"""
+Script to filter significant enrichments (p_adj < 0.05)
+and generate a VERTICAL heatmap (core → shell → cloud) with range -5 to +5.
+
+- Colorbar of log2 odds ratio in ALL 3 TYPES (core, shell, cloud).
+- WITHOUT α gradient.
+- "log2 odds ratio" vertically to the LEFT of its colorbar.
+- "Species" visible in all 3 rows, NORMAL typography (not bold).
+- xlabel "COG category" ONLY on cloud, NORMAL typography (not bold).
+- Species with NORMAL typography, colored by α group.
+- COG labels:
+    * COG unique to one type  → full name in that type.
+    * COG present in ≥2 types → full name ONLY in cloud
+      (or in the lowest type where it appears).
+    * Rest → only the letter.
+- Shell and cloud COGs reordered according to CORE order.
+"""
+
+import os
+import pandas as pd
+import numpy as np
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+INPUT_FILE = "/media/mordor/hector/brady_spp/13_pangenoma_NOVO/Results_eggnop-mapper/COG_enrichment_all_categories_with_adj.csv"
+OUTPUT_CSV = "/media/mordor/hector/brady_spp/13_pangenoma_NOVO/Results_eggnop-mapper/significant_only_p_adj_0.05.csv"
+OUTPUT_HEATMAP = "/media/mordor/hector/brady_spp/13_pangenoma_NOVO/Results_eggnop-mapper/fig3c_heatmap_significant_only.png"
+
+COG_DESCRIPTIONS = {
+    'A': 'RNA processing and modification',
+    'B': 'Chromatin structure and dynamics',
+    'C': 'Energy production and conversion',
+    'D': 'Cell cycle control...', #, cell division, chromosome partitioning
+    'E': 'Amino acid transport and metabolism',
+    'F': 'Nucleotide transport and metabolism',
+    'G': 'Carbohydrate transport and metabolism',
+    'H': 'Coenzyme transport and metabolism',
+    'I': 'Lipid transport and metabolism',
+    'J': 'Translation, ribosomal structure and biogenesis',
+    'K': 'Transcription',
+    'L': 'Replication, recombination and repair',
+    'M': 'Cell wall/membrane/envelope biogenesis',
+    'N': 'Cell motility',
+    'O': 'Posttranslational modification, protein turnover, chaperones',
+    'P': 'Inorganic ion transport and metabolism',
+    'Q': 'Secondary metabolites biosynthesis, transport and catabolism',
+    'R': 'General function prediction only',
+    'S': 'Function unknown',
+    'T': 'Signal transduction mechanisms',
+    'U': 'Intracellular trafficking, secretion, and vesicular transport',
+    'V': 'Defense mechanisms',
+    'W': 'Extracellular structures',
+    'Y': 'Nuclear structure',
+    'Z': 'Cytoskeleton'
+}
+
+# =============================================================================
+# ALPHA GROUPS
+# =============================================================================
+ALPHA_GROUPS = {
+    'High-α': {
+        'species': ['B_sp15', 'B_denitrificans', 'B_sp148', 'B_sp150', 
+        'B_sp7', 'B_sp151', 'B_sp149', 'B_sp107'],
+        'color': 'darkorange',
+    },
+    'Intermediate-α': {
+        'species': ['B_elkanii', 'B_ottawaense', 
+        'B_diazoefficiens', 'B_japonicum'],
+        'color': 'gold',
+    },
+    'Low-α': {
+        'species': ['B_barranii', 'B_sp11', 'B_zhanjiangense',
+                    'B_australafricanum', 'B_yuanmingense'],
+        'color': 'green',
+    },
+}
+
+# =============================================================================
+# LOADING AND FILTERING
+# =============================================================================
+print("Loading file...")
+df = pd.read_csv(INPUT_FILE)
+
+df_sig = df.dropna(subset=['p_adj_Bonf', 'log2_odds']).copy()
+df_sig = df_sig[df_sig['p_adj_Bonf'] < 0.05]
+
+print(f"Total significant tests (p_adj_Bonf < 0.05): {len(df_sig)}")
+
+df_sig.to_csv(OUTPUT_CSV, index=False)
+print(f"File saved: {OUTPUT_CSV}")
+
+# =============================================================================
+# SPECIES ORDER BY ALPHA GROUP
+# =============================================================================
+present_species = set(df_sig['species'].unique())
+
+species_order = []
+species_color = {}
+for group_name, info in ALPHA_GROUPS.items():
+    for sp in info['species']:
+        species_color[sp] = info['color']
+        if sp in present_species:
+            species_order.append(sp)
+
+unclassified = sorted(present_species - set(species_order))
+for sp in unclassified:
+    species_color[sp] = 'black'
+species_order += unclassified
+
+if unclassified:
+    print("WARNING: species without assigned α group:", unclassified)
+
+# =============================================================================
+# COG ORDER ACCORDING TO CORE
+# =============================================================================
+categories = ['core', 'shell', 'cloud']
+
+core_df = df_sig[df_sig['category'] == 'core']
+if not core_df.empty:
+    core_pivot = core_df.pivot(index='species', columns='COG', values='log2_odds')
+    cog_order_core = core_pivot.mean(axis=0).sort_values(ascending=False).index.tolist()
+else:
+    cog_order_core = []
+
+all_cogs = sorted(df_sig['COG'].unique())
+cog_order = cog_order_core + [c for c in all_cogs if c not in cog_order_core]
+
+print(f"COG order (according to core): {cog_order}")
+
+# =============================================================================
+# IN WHICH TYPE TO SHOW THE FULL NAME OF EACH COG?
+# =============================================================================
+cog_presence = {c: set() for c in cog_order}
+for cat in categories:
+    for c in df_sig[df_sig['category'] == cat]['COG'].unique():
+        if c in cog_presence:
+            cog_presence[c].add(cat)
+
+cog_full_name_in = {}
+for c, types in cog_presence.items():
+    if len(types) == 1:
+        cog_full_name_in[c] = next(iter(types))
+    else:
+        for t in ['cloud', 'shell', 'core']:
+            if t in types:
+                cog_full_name_in[c] = t
+                break
+
+print("COGs with full name by category:")
+for cat in categories:
+    cogs_here = [c for c, t in cog_full_name_in.items() if t == cat]
+    print(f"  {cat}: {cogs_here}")
+
+# =============================================================================
+# VERTICAL HEATMAP (core → shell → cloud)
+# =============================================================================
+norm = mpl.colors.Normalize(vmin=-5, vmax=5)
+cmap = plt.cm.RdBu_r
+
+fig = plt.figure(figsize=(15, 22))
+
+outer = fig.add_gridspec(
+    3, 2,
+    width_ratios=[40, 1],
+    wspace=0.06,
+    hspace=0.45,
+)
+
+for idx, cat in enumerate(categories):
+    # -------------------------------------------------------------------
+    # Heatmap
+    # -------------------------------------------------------------------
+    ax = fig.add_subplot(outer[idx, 0])
+    cat_df = df_sig[df_sig['category'] == cat]
+
+    if not cat_df.empty:
+        pivot = cat_df.pivot(index='species', columns='COG', values='log2_odds')
+        pivot = pivot.reindex(index=species_order).fillna(0)
+
+        available_cogs = [c for c in cog_order if c in pivot.columns]
+        pivot = pivot[available_cogs]
+
+        sns.heatmap(
+            pivot, ax=ax, cmap=cmap, center=0, norm=norm,
+            cbar=False, linewidths=0.5, vmin=-5, vmax=5,
+        )
+        ax.set_title(f'{cat.capitalize()} enrichment', fontsize=14, pad=10)
+        # "Species" in NORMAL typography (not bold)
+        ax.set_ylabel('Species', fontsize=13, fontweight='normal')
+
+        # ---- COG labels ----
+        labels = []
+        for c in pivot.columns:
+            if cog_full_name_in.get(c) == cat:
+                labels.append(f"{c}: {COG_DESCRIPTIONS.get(c, '')}")
+            else:
+                labels.append(str(c))
+
+        if cat == 'cloud':
+            ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=12) #9
+            # "COG category" in NORMAL typography (not bold)
+            ax.set_xlabel('COG category', fontsize=13, fontweight='normal',
+                          labelpad=14)
+        else:
+            ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=12) #9
+            ax.set_xlabel('')
+
+        # Species: NORMAL typography, colored by α group
+        for label in ax.get_yticklabels():
+            sp = label.get_text()
+            label.set_color(species_color.get(sp, 'black'))
+            label.set_fontweight('normal')
+            label.set_fontsize(11)
+    else:
+        ax.text(0.5, 0.5, 'No significant data',
+                ha='center', va='center', transform=ax.transAxes)
+        ax.set_title(f'{cat.capitalize()} - No data')
+        ax.set_ylabel('Species', fontsize=12, fontweight='normal')
+        ax.set_xlabel('')
+        if cat == 'cloud':
+            ax.set_xlabel('COG category', fontsize=14, fontweight='normal',
+                          labelpad=14)
+
+    # -------------------------------------------------------------------
+    # Colorbar log2 odds ratio PER ROW (core, shell and cloud)
+    # -------------------------------------------------------------------
+    cbar_ax = fig.add_subplot(outer[idx, 1])
+    sm = mpl.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, cax=cbar_ax)
+    cbar.ax.yaxis.set_label_position('left')   # label on the left
+    cbar.ax.yaxis.tick_right()                 # numbers on the right
+    cbar.set_label('log2 odds ratio', fontsize=11, labelpad=8)
+    cbar.ax.tick_params(labelsize=9)
+
+# ---------------------------------------------------------------------------
+plt.savefig(OUTPUT_HEATMAP, dpi=350, bbox_inches='tight')
+plt.close()
+print(f"Heatmap saved: {OUTPUT_HEATMAP}")
+print("\nProcess completed!")
+
+
+
+
+
+
+
