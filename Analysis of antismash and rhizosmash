@@ -1,0 +1,947 @@
+# Analysis of antismash and rhizosmash
+
+# conda activate antismash_envs
+
+#!/bin/bash
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+INPUT_DIR="/XXXX/XXXX/XXXX/list_bueno_brady"
+OUTPUT_DIR="/XXXX/XXXX/XXXX/results_anti_mash"
+LOG_DIR="${OUTPUT_DIR}/logs"
+THREADS=25
+CPUS_PER_GENOME=2   # Cores per genome
+
+# ==============================================================================
+# DIRECTORY PREPARATION
+# ==============================================================================
+mkdir -p "${OUTPUT_DIR}" "${LOG_DIR}"
+
+# ==============================================================================
+# PROCESSING FUNCTION
+# ==============================================================================
+process_genome() {
+    local gbff_file="$1"
+    local base_id=$(basename "${gbff_file}" .gbff)
+    local timestamp=$(date +"%Y%m%d_%H%M%S")
+    local log_file="${LOG_DIR}/${base_id}_${timestamp}.log"
+
+    echo "PROCESSING STARTED: ${base_id}" | tee -a "${log_file}"
+    echo "INPUT: ${gbff_file}" | tee -a "${log_file}"
+    
+    local output_subdir="${OUTPUT_DIR}/${base_id}"
+
+    {
+        echo "===== ANTISMASH COMMAND ====="
+        echo "antismash \\
+            --output-dir \"${output_subdir}\" \\
+            --genefinding-tool prodigal \\
+            --taxon bacteria \\
+            --cpus ${CPUS_PER_GENOME} \\
+            --asf \\
+            --enable-html \\
+            --cc-mibig \\
+            --cb-general \\
+            --cb-subclusters \\
+            --cb-knownclusters \\
+            --smcog-trees \\
+            --rre \\
+            --pfam2go \\
+            \"${gbff_file}\""
+        
+        timeout 48h antismash \
+            --output-dir "${output_subdir}" \
+            --genefinding-tool prodigal \
+            --taxon bacteria \
+            --cpus ${CPUS_PER_GENOME} \
+            --asf \
+            --enable-html \
+            --cc-mibig \
+            --cb-general \
+            --cb-subclusters \
+            --cb-knownclusters \
+            --smcog-trees \
+            --rre \
+            --pfam2go \
+            "${gbff_file}"
+
+        exit_code=$?
+        echo "===== EXIT STATUS: ${exit_code} ====="
+        [[ ${exit_code} -eq 0 ]] && echo "STATUS: SUCCESS" || echo "STATUS: FAILED"
+    } &> "${log_file}"
+
+    if [[ ${exit_code} -eq 0 ]]; then
+        tar -czf "${output_subdir}.tar.gz" -C "$(dirname "${output_subdir}")" "$(basename "${output_subdir}")"
+        rm -rf "${output_subdir}"
+        echo "COMPRESSED: ${output_subdir}.tar.gz" | tee -a "${log_file}"
+    fi
+
+    echo "PROCESSING COMPLETED: ${base_id}" | tee -a "${log_file}"
+    return ${exit_code}
+}
+
+export -f process_genome
+export OUTPUT_DIR LOG_DIR CPUS_PER_GENOME
+
+# ==============================================================================
+# MAIN EXECUTION
+# ==============================================================================
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate antismash_env
+
+echo "===== ANTISMASH BATCH PROCESSING STARTED ====="
+echo "START TIME: $(date)"
+echo "TOTAL THREADS (genomes in parallel): ${THREADS}"
+echo "CPUs per genome: ${CPUS_PER_GENOME}"
+
+find "${INPUT_DIR}" -maxdepth 1 -type f -name "*.gbff" | \
+xargs -I {} -P ${THREADS} bash -c 'process_genome "$@"' _ {}
+
+echo "===== PROCESSING COMPLETED ====="
+echo "END TIME: $(date)"
+echo "SUMMARY:"
+
+success_count=$(grep -l "STATUS: SUCCESS" "${LOG_DIR}"/*.log 2>/dev/null | wc -l)
+failed_count=$(grep -l "STATUS: FAILED" "${LOG_DIR}"/*.log 2>/dev/null | wc -l)
+total_count=$(find "${INPUT_DIR}" -maxdepth 1 -type f -name "*.gbff" | wc -l)
+
+echo " - Total genomes processed: ${total_count}"
+echo " - Successful: ${success_count}"
+echo " - Failed: ${failed_count}"
+
+##############################################
+#############################################
+
+# conda activate rhizosmash_envs
+
+#!/bin/bash
+
+# ============================
+# CONFIGURATION
+# ============================
+
+INPUT_DIR="list_bueno_brady"   # folder containing the .gbff files
+OUTDIR="results_rhizosmash"
+LOGDIR="logs_rhizosmash"
+
+THREADS=20
+
+# ============================
+# PREPARATION
+# ============================
+
+mkdir -p $OUTDIR
+mkdir -p $LOGDIR
+
+echo "======================================"
+echo "RhizoSMASH batch started"
+echo "Searching for .gbff files in: $INPUT_DIR"
+echo "======================================"
+
+# ============================
+# EXECUTION
+# ============================
+
+find $INPUT_DIR -name "*.gbff" | parallel -j $THREADS '
+file={};
+base=$(basename $file .gbff)
+
+OUT="'$OUTDIR'/out_$base"
+LOG="'$LOGDIR'/$base.log"
+
+if [ ! -d "$OUT" ]; then
+    echo "Processing $base..."
+
+    rhizosmash "$file" \
+        --output-dir "$OUT" \
+        --cb-knownclusters \
+        --genefinding-tool prodigal \
+        > "$LOG" 2>&1
+
+    echo "OK $base"
+else
+    echo "SKIP $base"
+fi
+'
+
+echo "======================================"
+echo "FINISHED"
+echo "======================================"
+
+
+############################################
+############################################
+# Data analysis: Antismash
+
+#!/usr/bin/env python3
+
+import os
+import csv
+import glob
+import zipfile
+import tarfile
+import concurrent.futures
+from collections import defaultdict
+import logging
+import re
+from bs4 import BeautifulSoup
+import html
+
+# Logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('antismash_processing.log'),
+        logging.StreamHandler()
+    ]
+)
+
+# Configure paths
+base_dir = '/xxx/xxxx/xxxxx4/results_anti_mash'
+species_map_path = '/xxxx/xxxx/xxxxx/species_total.csv'
+output_file = 'antismash_results_summary.tsv'
+error_file = 'failed_genomes.txt'
+
+# Read species mapping
+species_mapping = {}
+try:
+    with open(species_map_path, 'r') as f:
+        reader = csv.reader(f)
+        next(reader)  # Skip header
+        for row in reader:
+            if len(row) >= 2 and row[0].strip() and row[1].strip():
+                genome_id = row[0].strip()
+                species = row[1].strip().rstrip(',')
+                species_mapping[genome_id] = species
+            else:
+                logging.warning(f"Row skipped due to incorrect format: {row}")
+except Exception as e:
+    logging.error(f"Error reading species mapping: {e}")
+    exit(1)
+
+logging.info(f"Species mapping loaded: {len(species_mapping)} entries")
+
+# Find all compressed files (both .zip and .tar.gz)
+compressed_files = glob.glob(os.path.join(base_dir, '*.zip')) + glob.glob(os.path.join(base_dir, '*.tar.gz'))
+
+logging.info(f"Found {len(compressed_files)} compressed files")
+
+def clean_text(text):
+    """Cleans text of special characters but keeps commas and periods"""
+    if not text:
+        return text
+    
+    # Decode HTML entities
+    text = html.unescape(text)
+    
+    # Replace non-breaking spaces with normal spaces
+    text = text.replace('\xa0', ' ').replace('&nbsp;', ' ')
+    
+    # Remove multiple spaces but keep commas and periods
+    text = re.sub(r'[^\S\n]+', ' ', text)
+    
+    return text.strip()
+
+def format_coordinates(coord_text):
+    """Formats coordinates keeping commas for better readability"""
+    if not coord_text:
+        return coord_text
+    
+    # Clean the text
+    coord_text = clean_text(coord_text)
+    
+    # Remove any spaces inside the number but keep commas
+    coord_text = coord_text.replace(' ', '')
+    
+    # Ensure commas are correctly placed (every 3 digits)
+    try:
+        # If it already has commas, check they are in correct positions
+        if ',' in coord_text:
+            # Check if commas are in correct positions
+            parts = coord_text.split(',')
+            # If all parts except the first have 3 digits, it's well formatted
+            if all(len(part) == 3 for part in parts[1:]):
+                return coord_text
+            else:
+                # Reformat if commas are not in correct positions
+                num = int(coord_text.replace(',', ''))
+                return f"{num:,}"
+        else:
+            # Add commas if missing
+            num = int(coord_text)
+            return f"{num:,}"
+    except ValueError:
+        # If not a number, return cleaned text
+        return coord_text
+
+def extract_overview_from_html(html_content, genome_id, species):
+    """Extracts antiSMASH overview information from HTML content"""
+    soup = BeautifulSoup(html_content, 'html.parser')
+    regions = []
+    
+    # Find all record headers
+    record_headers = soup.find_all('div', class_='record-overview-header')
+    
+    for header in record_headers:
+        # Extract record ID and species
+        strong_tag = header.find('strong')
+        if not strong_tag:
+            continue
+            
+        record_text = clean_text(strong_tag.get_text())
+        # Format is: "ID (species)"
+        record_parts = record_text.split('(')
+        if len(record_parts) >= 2:
+            record_id = clean_text(record_parts[0])
+            record_species = clean_text(record_parts[1].rstrip(')'))
+        else:
+            record_id = clean_text(record_text)
+            record_species = species
+        
+        # Find region table for this record
+        record_details = header.find_next_sibling('div', class_='record-overview-details')
+        if not record_details:
+            continue
+            
+        overview_table = record_details.find('table', class_='region-table')
+        if not overview_table:
+            continue
+        
+        # Extract table rows (skip header)
+        rows = overview_table.find_all('tr')[1:]
+        
+        for row in rows:
+            cells = row.find_all('td')
+            if len(cells) < 4:
+                continue
+                
+            # Extract region number
+            region_cell = cells[0]
+            region_link = region_cell.find('a')
+            if region_link:
+                region_text = clean_text(region_link.get_text())
+            else:
+                region_text = clean_text(region_cell.get_text())
+            
+            # Extract type
+            type_cell = cells[1]
+            type_links = type_cell.find_all('a')
+            if type_links:
+                region_type = ', '.join([clean_text(link.get_text()) for link in type_links])
+            else:
+                region_type = clean_text(type_cell.get_text())
+            
+            # Extract coordinates - keep commas for readability
+            from_coord = format_coordinates(cells[2].get_text())
+            to_coord = format_coordinates(cells[3].get_text())
+            
+            # Extract similarity and similar cluster (if available)
+            similarity = ""
+            similar_cluster = ""
+            
+            if len(cells) > 4:
+                similarity_cell = cells[4]
+                if 'similarity-text' in similarity_cell.get('class', []):
+                    similarity = clean_text(similarity_cell.get_text())
+                    
+                    if len(cells) > 5:
+                        cluster_cell = cells[5]
+                        cluster_link = cluster_cell.find('a')
+                        if cluster_link:
+                            similar_cluster = clean_text(cluster_link.get_text())
+                        else:
+                            similar_cluster = clean_text(cluster_cell.get_text())
+            
+            regions.append({
+                'Genome': genome_id,
+                'Record': record_id,
+                'Species': record_species,
+                'Region': region_text,
+                'Type': region_type,
+                'From': from_coord,
+                'To': to_coord,
+                'Similarity': similarity,
+                'Most_Similar_Cluster': similar_cluster,
+                'File': f"{genome_id}.tar.gz"
+            })
+    
+    return regions
+
+def find_and_read_html(compressed_file):
+    """Finds and reads HTML content from a compressed file without fully extracting it"""
+    html_content = None
+    
+    try:
+        if compressed_file.endswith('.zip'):
+            with zipfile.ZipFile(compressed_file, 'r') as zip_ref:
+                # Look for index.html
+                html_files = [f for f in zip_ref.namelist() if f.endswith('index.html')]
+                if not html_files:
+                    # Look for any HTML
+                    html_files = [f for f in zip_ref.namelist() if f.endswith('.html')]
+                
+                if html_files:
+                    with zip_ref.open(html_files[0]) as f:
+                        html_content = f.read().decode('utf-8')
+        
+        elif compressed_file.endswith('.tar.gz'):
+            with tarfile.open(compressed_file, 'r:gz') as tar_ref:
+                # Look for index.html
+                html_files = [m for m in tar_ref.getmembers() 
+                             if m.name.endswith('index.html') and m.isfile()]
+                if not html_files:
+                    # Look for any HTML
+                    html_files = [m for m in tar_ref.getmembers() 
+                                 if m.name.endswith('.html') and m.isfile()]
+                
+                if html_files:
+                    f = tar_ref.extractfile(html_files[0])
+                    html_content = f.read().decode('utf-8')
+                    f.close()
+    
+    except Exception as e:
+        logging.error(f"Error reading HTML from {compressed_file}: {e}")
+    
+    return html_content
+
+def extract_antismash_info(compressed_file):
+    """Extracts antiSMASH overview information from a compressed file"""
+    genome_results = []
+    base_name = os.path.basename(compressed_file).replace('.tar.gz', '').replace('.zip', '')
+    
+    # Look for genome ID in species mapping
+    genome_id = None
+    species = 'Unknown'
+    
+    # Try different ID variants
+    possible_ids = [base_name, base_name[:15], base_name.split('_')[0]]
+    for pid in possible_ids:
+        if pid in species_mapping:
+            genome_id = pid
+            species = species_mapping[pid]
+            break
+    
+    if genome_id is None:
+        genome_id = base_name
+    
+    try:
+        # Read HTML content directly from compressed file
+        html_content = find_and_read_html(compressed_file)
+        
+        if not html_content:
+            logging.warning(f"No HTML found in {compressed_file}")
+            return []
+        
+        # Extract overview information
+        regions = extract_overview_from_html(html_content, genome_id, species)
+        
+        if regions:
+            logging.info(f"Processed {compressed_file} - {len(regions)} regions found")
+            return regions
+        else:
+            logging.warning(f"No regions found in overview of {compressed_file}")
+            return []
+        
+    except Exception as e:
+        logging.error(f"Error processing {compressed_file}: {e}")
+        # Save failed genome
+        with open(error_file, 'a') as err_f:
+            err_f.write(f"{compressed_file}\t{str(e)}\n")
+        return []
+
+# Clean error file
+if os.path.exists(error_file):
+    os.remove(error_file)
+
+# Process files in parallel
+all_results = []
+failed_count = 0
+
+# Use parallel processing
+with concurrent.futures.ProcessPoolExecutor(max_workers=min(os.cpu_count(), 8)) as executor:
+    future_to_file = {executor.submit(extract_antismash_info, f): f for f in compressed_files}
+    
+    for i, future in enumerate(concurrent.futures.as_completed(future_to_file)):
+        file = future_to_file[future]
+        try:
+            result = future.result()
+            all_results.extend(result)
+            
+            # Show progress every 10 files
+            if (i + 1) % 10 == 0:
+                logging.info(f"Processed {i + 1}/{len(compressed_files)} files, {len(all_results)} regions found")
+                
+        except Exception as e:
+            logging.error(f"Error processing {file}: {e}")
+            failed_count += 1
+
+# Write results
+if all_results:
+    # Ensure all fields are present
+    fieldnames = ['Genome', 'Record', 'Species', 'Region', 'Type', 'From', 'To', 
+                  'Similarity', 'Most_Similar_Cluster', 'File']
+    
+    with open(output_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
+        writer.writeheader()
+        writer.writerows(all_results)
+    
+    # Statistics
+    unique_genomes = len(set(r['Genome'] for r in all_results))
+    regions_by_type = defaultdict(int)
+    
+    for r in all_results:
+        regions_by_type[r['Type']] += 1
+    
+    logging.info(f"Processing completed:")
+    logging.info(f"- Total regions found: {len(all_results)}")
+    logging.info(f"- Total genomes processed: {unique_genomes}")
+    logging.info(f"- Failed files: {failed_count}")
+    
+    logging.info(f"- Region type distribution:")
+    for region_type, count in sorted(regions_by_type.items(), key=lambda x: x[1], reverse=True)[:20]:
+        logging.info(f"  {region_type}: {count}")
+    
+    # Save summary
+    with open('processing_summary.txt', 'w') as summary:
+        summary.write(f"Total files processed: {len(compressed_files)}\n")
+        summary.write(f"Genomes successfully processed: {unique_genomes}\n")
+        summary.write(f"Failed files: {failed_count}\n")
+        summary.write(f"Total BGC regions found: {len(all_results)}\n")
+        summary.write("\nRegion type distribution (top 20):\n")
+        for region_type, count in sorted(regions_by_type.items(), key=lambda x: x[1], reverse=True)[:20]:
+            summary.write(f"{region_type}: {count}\n")
+    
+else:
+    logging.error("No results found to process")
+
+logging.info("Process finished")
+
+########################################
+########################################
+
+# Data analysis: Rhizosmash
+
+#!/usr/bin/env python3
+
+import os
+import csv
+import re
+import logging
+from bs4 import BeautifulSoup
+import html
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
+base_dir = '/XXXX/XXXXX/XXXXXX/results_rhizosmash'
+species_map_path = '/XXXX/XXXX/XXXXXX/data_rhizo_anti_SMASH/species_total.csv'
+output_file = 'rhizosmash_results_summary.tsv'
+error_file = 'failed_genomes.txt'
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('rhizosmash_processing.log'),
+        logging.StreamHandler()
+    ]
+)
+
+# ------------------------------------------------------------
+# Load species mapping
+# ------------------------------------------------------------
+species_mapping = {}
+try:
+    with open(species_map_path, 'r') as f:
+        reader = csv.reader(f)
+        next(reader)  # skip header
+        for row in reader:
+            if len(row) >= 2 and row[0].strip() and row[1].strip():
+                genome_id = row[0].strip()
+                species = row[1].strip().rstrip(',')
+                species_mapping[genome_id] = species
+            else:
+                logging.warning(f"Row skipped due to format: {row}")
+except Exception as e:
+    logging.error(f"Error reading species mapping: {e}")
+    exit(1)
+
+logging.info(f"Species mapping loaded: {len(species_mapping)} entries")
+
+# ------------------------------------------------------------
+# Find result folders
+# ------------------------------------------------------------
+all_dirs = [d for d in os.listdir(base_dir)
+            if os.path.isdir(os.path.join(base_dir, d)) and d.startswith('out_')]
+logging.info(f"Found {len(all_dirs)} result folders")
+
+# ------------------------------------------------------------
+# Helper functions
+# ------------------------------------------------------------
+def clean_text(text):
+    """Cleans HTML entities and extra spaces."""
+    if not text:
+        return text
+    text = html.unescape(text)
+    text = text.replace('\xa0', ' ').replace('&nbsp;', ' ')
+    text = re.sub(r'[^\S\n]+', ' ', text)
+    return text.strip()
+
+def extract_genome_id_from_dir(dirname):
+    """
+    Extracts the genome identifier from the folder name.
+    Example: out_GCF_000239815.1_ASM23981v2_genomic -> GCF_000239815.1
+    """
+    base = dirname[4:]  # remove 'out_'
+    if base.endswith('_genomic'):
+        base = base[:-8]  # remove '_genomic'
+    parts = base.split('_')
+    if len(parts) >= 2:
+        return f"{parts[0]}_{parts[1]}"
+    return base  # fallback
+
+def extract_rhizosmash_info(dir_path, genome_id, species):
+    """Extracts all regions from index.html."""
+    html_path = os.path.join(dir_path, 'index.html')
+    if not os.path.exists(html_path):
+        logging.warning(f"index.html not found in {dir_path}")
+        return []
+
+    try:
+        with open(html_path, 'r', encoding='utf-8') as f:
+            soup = BeautifulSoup(f.read(), 'html.parser')
+    except Exception as e:
+        logging.error(f"Error reading {html_path}: {e}")
+        return []
+
+    regions = []
+
+    # Find all record detail divs
+    detail_divs = soup.find_all('div', class_='record-overview-details')
+    for div in detail_divs:
+        table = div.find('table', class_='region-table')
+        if not table:
+            continue
+
+        # Skip header
+        rows = table.find_all('tr')[1:]
+        for row in rows:
+            cells = row.find_all('td')
+            if not cells:
+                continue
+
+            # Extract region (first cell)
+            region_cell = cells[0]
+            region_link = region_cell.find('a')
+            region = clean_text(region_link.get_text()) if region_link else clean_text(region_cell.get_text())
+
+            # Extract type (second cell)
+            type_cell = cells[1]
+            type_links = type_cell.find_all('a')
+            if type_links:
+                region_type = ', '.join(clean_text(link.get_text()) for link in type_links)
+            else:
+                region_type = clean_text(type_cell.get_text())
+
+            # Coordinates (third and fourth cells)
+            from_coord = clean_text(cells[2].get_text())
+            to_coord = clean_text(cells[3].get_text())
+
+            # Number of cells determines if there is a similar cluster
+            if len(cells) == 5:
+                # No similar cluster (colspan=3)
+                most_similar = ''
+                category = ''
+                similarity = ''
+            elif len(cells) == 7:
+                # There is a cluster: cell4 = name, cell5 = category, cell6 = similarity
+                most_similar = clean_text(cells[4].get_text())
+                category = clean_text(cells[5].get_text())
+                similarity = clean_text(cells[6].get_text())
+            else:
+                # Unexpected number, log and skip
+                logging.debug(f"Unexpected number of cells ({len(cells)}) in {html_path}")
+                continue
+
+            # Use genome as "Record" (no record identifier in RhizoSMASH)
+            record = genome_id
+
+            regions.append({
+                'Genome': genome_id,
+                'Record': record,
+                'Species': species,
+                'Region': region,
+                'Type': region_type,
+                'From': from_coord,
+                'To': to_coord,
+                'Most_Similar_Cluster': most_similar,
+                'Category': category,
+                'Similarity': similarity,
+                'File': os.path.basename(dir_path)  # folder name
+            })
+
+    return regions
+
+# ------------------------------------------------------------
+# Process each folder (sequential or parallel)
+# ------------------------------------------------------------
+if os.path.exists(error_file):
+    os.remove(error_file)
+
+all_results = []
+failed_count = 0
+
+# Option 1: sequential processing (simpler for debugging)
+for dir_name in all_dirs:
+    dir_path = os.path.join(base_dir, dir_name)
+    genome_id = extract_genome_id_from_dir(dir_name)
+    species = species_mapping.get(genome_id, 'Unknown')
+    if species == 'Unknown':
+        logging.warning(f"No species found for {genome_id} (dir {dir_name})")
+
+    try:
+        regions = extract_rhizosmash_info(dir_path, genome_id, species)
+        if regions:
+            all_results.extend(regions)
+            logging.info(f"Processed {dir_name}: {len(regions)} regions")
+        else:
+            logging.warning(f"No regions found in {dir_name}")
+    except Exception as e:
+        logging.error(f"Error processing {dir_name}: {e}")
+        failed_count += 1
+        with open(error_file, 'a') as err_f:
+            err_f.write(f"{dir_name}\t{str(e)}\n")
+
+# Option 2: parallel processing (uncomment to use)
+# with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+#     future_to_dir = {executor.submit(extract_rhizosmash_info, os.path.join(base_dir, d), extract_genome_id_from_dir(d), species_mapping.get(extract_genome_id_from_dir(d), 'Unknown')): d for d in all_dirs}
+#     for future in as_completed(future_to_dir):
+#         dir_name = future_to_dir[future]
+#         try:
+#             regions = future.result()
+#             if regions:
+#                 all_results.extend(regions)
+#                 logging.info(f"Processed {dir_name}: {len(regions)} regions")
+#             else:
+#                 logging.warning(f"No regions found in {dir_name}")
+#         except Exception as e:
+#             logging.error(f"Error processing {dir_name}: {e}")
+#             failed_count += 1
+#             with open(error_file, 'a') as err_f:
+#                 err_f.write(f"{dir_name}\t{str(e)}\n")
+
+# ------------------------------------------------------------
+# Write results
+# ------------------------------------------------------------
+if all_results:
+    fieldnames = ['Genome', 'Record', 'Species', 'Region', 'Type', 'From', 'To',
+                  'Most_Similar_Cluster', 'Category', 'Similarity', 'File']
+
+    with open(output_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
+        writer.writeheader()
+        writer.writerows(all_results)
+
+    unique_genomes = len(set(r['Genome'] for r in all_results))
+    regions_by_type = defaultdict(int)
+    for r in all_results:
+        regions_by_type[r['Type']] += 1
+
+    logging.info("Processing completed:")
+    logging.info(f"- Total regions: {len(all_results)}")
+    logging.info(f"- Genomes processed: {unique_genomes}")
+    logging.info(f"- Failed: {failed_count}")
+    logging.info("Most frequent region types:")
+    for t, cnt in sorted(regions_by_type.items(), key=lambda x: x[1], reverse=True)[:20]:
+        logging.info(f"  {t}: {cnt}")
+
+    # Save summary
+    with open('processing_summary.txt', 'w') as sum_f:
+        sum_f.write(f"Folders processed: {len(all_dirs)}\n")
+        sum_f.write(f"Genomes with data: {unique_genomes}\n")
+        sum_f.write(f"Failed: {failed_count}\n")
+        sum_f.write(f"Total regions: {len(all_results)}\n\n")
+        sum_f.write("Region types (top 20):\n")
+        for t, cnt in sorted(regions_by_type.items(), key=lambda x: x[1], reverse=True)[:20]:
+            sum_f.write(f"{t}: {cnt}\n")
+else:
+    logging.error("No results found")
+
+logging.info("Process finished")
+
+################################
+# ANTISMASH-TYPE CONVERTER
+
+#!/usr/bin/env python3
+
+import pandas as pd
+
+# === INPUT / OUTPUT ===
+input_file = "/XXXXXXX/XXXXXX/XXXXXXX/rhizosmash_results_filtered.tsv"
+output_file = "/XXXXXXX/XXXXXX/XXXXXX/rhizosmash_results_with_similarity.tsv"
+
+# === Load data ===
+df = pd.read_csv(input_file, sep="\t")
+
+# === Clean Similarity_1 column (remove % and convert to number) ===
+df["Similarity_numeric"] = df["Similarity_1"].str.replace("%", "").astype(float)
+
+# === Classification function ===
+def classify_similarity(x):
+    if x >= 75:
+        return "High"
+    elif 50 <= x < 75:
+        return "Medium"
+    elif 15 <= x < 50:
+        return "Low"
+    else:
+        return None  # <15% is removed according to antiSMASH
+
+# === Create new column ===
+df["Similarity"] = df["Similarity_numeric"].apply(classify_similarity)
+
+# === Filter values <15% (optional but recommended) ===
+df = df[df["Similarity"].notna()]
+
+# === Remove auxiliary column ===
+df = df.drop(columns=["Similarity_numeric"])
+
+# === Save file ===
+df.to_csv(output_file, sep="\t", index=False)
+
+print(f"File generated: {output_file}")
+
+
+
+
+##############################################
+#############################################
+
+# Data analysi: Presence/ausence
+
+#!/usr/bin/env python3
+
+import pandas as pd
+import os
+
+# =============================================================================
+# PATH CONFIGURATION (modify according to your system)
+# =============================================================================
+TSV_PATH = "/xxxx/xxxxx/xxxxxxx/antismash_results_filtrado.tsv"
+MATRIX_PATH = "presence_matrix_antismash.csv"
+CLUSTER_DB_PATH = "clusters_db_antismash.csv"
+DUPLICATES_LOG_PATH = "duplicates_cluster_species_with_records_antismash.txt"
+
+# =============================================================================
+# MAIN FUNCTION
+# =============================================================================
+def process_rhizosmash(tsv_path, output_matrix, output_db, output_log):
+    """
+    Reads the rhizoSMASH TSV, generates:
+      - Numeric presence matrix (species x clusters).
+      - Cluster database (cluster + category).
+      - Log file with details of multiple regions per species/cluster.
+    """
+    
+    # 1. Load data
+    print(f"Paste Reading file: {tsv_path}")
+    df = pd.read_csv(tsv_path, sep='\t')
+    df.columns = df.columns.str.strip()
+    
+    # Check required columns (we add Record and Region for the log)
+    required_columns = ['Genome', 'Species', 'Region', 'Type', 'Similarity', 'Most_Similar_Cluster']
+    for col in required_columns:
+        if col not in df.columns:
+            raise ValueError(f"Missing column '{col}' in file. Columns found: {list(df.columns)}")
+    
+    # 2. Map Similarity to numeric value
+    sim_map = {'Low': 1, 'Medium': 2, 'High': 3}
+    df['Sim_value'] = df['Similarity'].map(sim_map)
+    
+    # Check for unmapped values
+    unmapped = df[df['Sim_value'].isna()]['Similarity'].unique()
+    if len(unmapped) > 0:
+        print(f"X  Warning: Unrecognized Similarity values: {unmapped}. Will assign 0.")
+        df['Sim_value'] = df['Sim_value'].fillna(0).astype(int)
+    else:
+        df['Sim_value'] = df['Sim_value'].astype(int)
+    
+    # 3. Detect species with multiple regions of the same cluster
+    #    Group to count how many regions per (species, cluster)
+    counts = df.groupby(['Species', 'Most_Similar_Cluster']).size().reset_index(name='num_regions')
+    duplicate_clusters = counts[counts['num_regions'] > 1]
+    
+    if duplicate_clusters.empty:
+        print("ℹ️  No clusters found with more than one region per species.")
+        with open(output_log, 'w', encoding='utf-8') as f:
+            f.write("No clusters with multiple regions were detected for the same species.\n")
+    else:
+        # For each case with multiple regions, get details
+        log_lines = []
+        log_lines.append("=" * 80 + "\n")
+        log_lines.append("DETAIL OF CLUSTERS WITH MULTIPLE REGIONS PER SPECIES\n")
+        log_lines.append("=" * 80 + "\n\n")
+        
+        for _, row in duplicate_clusters.iterrows():
+            sp = row['Species']
+            clust = row['Most_Similar_Cluster']
+            
+            # Filter original dataframe for this species-cluster pair
+            subdf = df[(df['Species'] == sp) & (df['Most_Similar_Cluster'] == clust)].copy()
+            subdf = subdf.sort_values('Record')
+            
+            # Get unique numeric similarity values
+            unique_values = sorted(subdf['Sim_value'].unique())
+            max_value = subdf['Sim_value'].max()
+            
+            # Build log entry
+            log_lines.append(f"Species: {sp}\n")
+            log_lines.append(f"Cluster: {clust}\n")
+            log_lines.append(f"Similarity values found: {unique_values}\n")
+            log_lines.append("Regions involved:\n")
+            
+            for _, reg in subdf.iterrows():
+                sim_original = reg['Similarity']
+                sim_num = reg['Sim_value']
+                log_lines.append(f"  - Record: {reg['Record']} | Region: {reg['Region']} | Similarity: {sim_original} ({sim_num})\n")
+            
+            log_lines.append(f"Value kept (maximum): {max_value}\n")
+            log_lines.append("-" * 40 + "\n\n")
+        
+        # Save log file
+        with open(output_log, 'w', encoding='utf-8') as f:
+            f.writelines(log_lines)
+        print(f"V Log file with record details saved to: {output_log}")
+    
+    # 4. Build cluster database (Most_Similar_Cluster -> Category)
+    cluster_db = df[['Most_Similar_Cluster', 'Type']].drop_duplicates(subset='Most_Similar_Cluster')
+    cluster_db = cluster_db.sort_values('Most_Similar_Cluster').reset_index(drop=True)
+    cluster_db.to_csv(output_db, sep=';', index=False)
+    print(f"V Cluster database saved to: {output_db}")
+    
+    # 5. Create presence matrix (maximum value per species and cluster)
+    matrix = df.pivot_table(index='Species',
+                            columns='Most_Similar_Cluster',
+                            values='Sim_value',
+                            aggfunc='max',
+                            fill_value=0)
+    
+    matrix.to_csv(output_matrix, sep=';')
+    print(f"V Presence matrix saved to: {output_matrix}")
+    print(f"V Dimensions: {matrix.shape[0]} species x {matrix.shape[1]} clusters")
+
+# =============================================================================
+# EXECUTION
+# =============================================================================
+if __name__ == "__main__":
+    # Check that the input file exists
+    if not os.path.exists(TSV_PATH):
+        print(f"X Error: TSV file not found at:\n{TSV_PATH}")
+        print("Please edit the TSV_PATH variable in the script with the correct path.")
+    else:
+        process_rhizosmash(TSV_PATH, MATRIX_PATH, CLUSTER_DB_PATH, DUPLICATES_LOG_PATH)
