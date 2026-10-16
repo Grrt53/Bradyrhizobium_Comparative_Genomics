@@ -1,0 +1,81 @@
+############ Quality assessment ####################
+
+# Checkm2
+
+checkm2 predict \
+    --threads 38 \
+    --input /XXXX/XXXX \
+    -x fasta \
+    --output-directory /XXXX/checkm2_fna
+
+
+# BUSCO V6
+#!/bin/bash
+set -euo pipefail
+
+LINEAGE="/lineages/bradyrhizobium_odb12"
+GENOMES_DIR="/XXXXXXX/XXXXX"
+OUTDIR="/XXXX/XXXXX/XXX"
+CPU=40
+
+mkdir -p "$OUTDIR"
+
+shopt -s nullglob
+genomes=("$GENOMES_DIR"/*.fna)
+
+if [[ ${#genomes[@]} -eq 0 ]]; then
+    echo "ERROR: No .fna files found in $GENOMES_DIR"
+    exit 1
+fi
+
+echo ">>> Found ${#genomes[@]} genome files in: $GENOMES_DIR"
+echo
+
+for genome in "${genomes[@]}"; do
+
+    base=$(basename "$genome" .fna)
+    outname="${base}_busco"
+    outfolder="${OUTDIR}/${outname}"
+    logfile="${OUTDIR}/${outname}.log"
+
+    echo
+    echo "=========================================="
+    echo " Processing: $base"
+    echo " Input file: $genome"
+    echo " Output directory: $outfolder"
+    echo " Log file: $logfile"
+    echo "=========================================="
+    echo
+
+    # Remove previous results to start a clean run
+    if [[ -d "$outfolder" ]]; then
+        echo "Removing previous output directory: $outfolder"
+        rm -rf "$outfolder"
+    fi
+
+    # Remove previous log file
+    [[ -f "$logfile" ]] && rm -f "$logfile"
+
+    # Run BUSCO
+    if busco \
+        -i "$genome" \
+        -l "$LINEAGE" \
+        -o "$outname" \
+        -m genome \
+        --cpu "$CPU" \
+        --offline \
+        --out_path "$OUTDIR" \
+        &> "$logfile"; then
+
+        echo "BUSCO completed successfully for: $base"
+        echo "Results: $outfolder"
+
+    else
+        echo "ERROR: BUSCO failed for: $base"
+        echo "Check the log file: $logfile"
+    fi
+
+done
+
+echo
+echo ">>> All genome files have been processed."
