@@ -1,0 +1,358 @@
+# Phylogenomic and pangenome
+
+# Orthofinder
+
+orthofinder -f represent_correto/ -S diamond -M msa -t 40 
+
+
+# Script for orthogroup analysis
+
+# STEP: 1  Generate the Gene-to-Genome Mapping File
+
+cd /9_orthofinder/represent_correto/OrthoFinder/Results_May05
+
+awk -F': ' '
+  # Process SpeciesIDs.txt
+  FILENAME == "SpeciesIDs.txt" {
+    if ($0 ~ /^[0-9]+:/) {
+      species_id = $1;
+      gsub(/^[0-9]+\t/, "", $2);
+      species_name = $2;
+
+      # Extract the genome accession (e.g., GCF_000007825.1)
+      split(species_name, parts, "_");
+      genome_id = parts[1] "_" parts[2] "_" parts[3];
+
+      species_map[species_id] = genome_id;
+    }
+    next;
+  }
+
+  # Process SequenceIDs.txt
+  FILENAME == "SequenceIDs.txt" {
+    if ($0 ~ /^[0-9]+_[0-9]+:/) {
+      split($0, parts, ": ");
+      gene_id = parts[2];
+
+      # Remove the gene description
+      gsub(/\s.*$/, "", gene_id);
+
+      # Extract the species ID (number before the first underscore)
+      split(parts[1], id_parts, "_");
+      species_id = id_parts[1];
+
+      if (species_id in species_map) {
+        print gene_id "\t" species_map[species_id];
+      }
+    }
+  }
+' SpeciesIDs.txt SequenceIDs.txt > ../gene_to_genome.tsv
+
+
+# STEP: 2  Standardize Gene and Genome Identifiers
+
+cd /9_orthofinder/genomes_represent/OrthoFinder/Results_Mar03/
+
+awk -F'\t' '{
+    # Extract the gene ID (first word before the space)
+    split($1, gene_parts, " ");
+    gene_id = gene_parts[1];
+
+    # Extract the genome accession
+    split($2, genome_parts, "_");
+    genome_id = genome_parts[1] "_" genome_parts[2] "_" genome_parts[3];
+
+    print gene_id "\t" genome_id
+}' gene_to_genome.tsv > gene_to_genome_final.tsv
+
+
+
+# STEP: 3 Rename FASTA Headers Using Species Names
+
+##!/usr/bin/env python3
+
+import pandas as pd
+import os
+import sys
+
+def main():
+
+    # Define input directories and files
+    base_dir = "/9_orthofinder/genomes_represent/OrthoFinder/Results_Mar03/"
+    species_file = "/9_orthofinder/species_hector.ods"
+
+    # 1. Load the gene-to-genome mapping
+    try:
+        gene_genome = pd.read_csv(
+            os.path.join(base_dir, "gene_to_genome_final.tsv"),
+            sep="\t",
+            header=None,
+            names=["gene", "genome_full"]
+        )
+
+        # Standardize genome accession lengths
+        gene_genome["genome"] = gene_genome["genome_full"].apply(
+            lambda x: x[:15] if len(x) > 15 else x
+        )
+
+    except FileNotFoundError:
+        print("ERROR: gene_to_genome_final.tsv was not found.")
+        sys.exit(1)
+
+    # 2. Load the genome-to-species mapping
+    try:
+        genome_species = pd.read_excel(
+            species_file,
+            engine="odf"
+        )
+
+        # Normalize column names
+        genome_species.columns = [
+            col.strip().lower() for col in genome_species.columns
+        ]
+
+        # Select the relevant columns
+        if {"genome", "species"}.issubset(genome_species.columns):
+            genome_species = genome_species[["genome", "species"]]
+        else:
+            print(
+                "ERROR: The ODS file must contain "
+                "'genome' and 'species' columns."
+            )
+            sys.exit(1)
+
+        # Standardize genome accession lengths
+        genome_species["genome"] = genome_species["genome"].apply(
+            lambda x: x[:15] if len(x) > 15 else x
+        )
+
+    except Exception as e:
+        print(f"ERROR reading the species mapping file: {e}")
+        sys.exit(1)
+
+    # 3. Merge the mappings
+    merged = gene_genome.merge(
+        genome_species,
+        on="genome",
+        how="left"
+    )
+
+    merged["species"] = merged["species"].fillna("Unknown_species")
+
+    # Replace spaces in species names with underscores
+    merged["species"] = merged["species"].str.replace(" ", "_")
+
+    # 4. Save the final gene-to-species mapping
+    merged[["gene", "species"]].to_csv(
+        os.path.join(base_dir, "gene_to_species_final.tsv"),
+        sep="\t",
+        index=False,
+        header=False
+    )
+
+    # 5. Process single-copy orthologue FASTA files
+    input_dir = os.path.join(
+        base_dir,
+        "Single_Copy_Orthologue_Sequences"
+    )
+
+    output_dir = os.path.join(
+        base_dir,
+        "Species_Named_Orthogroups"
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Create the gene-to-species dictionary
+    gene_to_species = dict(
+        zip(merged["gene"], merged["species"])
+    )
+
+    total_genes = 0
+    mapped_genes = 0
+
+    # Rename FASTA headers
+    for filename in os.listdir(input_dir):
+        if filename.endswith(".fa"):
+
+            input_path = os.path.join(input_dir, filename)
+            output_path = os.path.join(output_dir, filename)
+
+            with open(input_path, "r") as infile, \
+                 open(output_path, "w") as outfile:
+
+                for line in infile:
+
+                    if line.startswith(">"):
+                        gene_id = line[1:].strip()
+                        total_genes += 1
+
+                        species = gene_to_species.get(
+                            gene_id,
+                            "Unknown_species"
+                        )
+
+                        if species != "Unknown_species":
+                            mapped_genes += 1
+
+                        outfile.write(
+                            f">{species}|{gene_id}\n"
+                        )
+
+                    else:
+                        outfile.write(line)
+
+    # 6. Print the final report
+    mapping_percentage = (
+        mapped_genes / total_genes * 100
+        if total_genes > 0 else 0
+    )
+
+    print("\nProcessing completed successfully.")
+    print(f"Total genes processed: {total_genes}")
+    print(
+        f"Successfully mapped genes: "
+        f"{mapped_genes} ({mapping_percentage:.2f}%)"
+    )
+    print(f"Unmapped genes: {total_genes - mapped_genes}")
+    print(f"Renamed FASTA files: {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+# STEP: 4 Multiple Sequence Alignment with MAFFT
+
+mkdir -p mafft_alignments
+
+for file in Species_Named_Orthogroups/*.fa; do
+    base_name=$(basename "$file" .fa)
+
+    mafft --auto --thread 30 --quiet "$file" > "mafft_alignments/${base_name}.aln"
+done
+
+
+# STEP: 5  Concatenate the Aligned Orthogroups
+
+#!/usr/bin/env python3
+
+from Bio import AlignIO
+import os
+
+input_dir = (
+    "/9_orthofinder/genomes_represent/OrthoFinder/"
+    "Results_Mar03/mafft_alignments"
+)
+
+output_file = "super_matrix_concatenated.fas"
+
+# 1. Collect unique species and alignment filenames
+species_set = set()
+file_list = []
+
+for filename in os.listdir(input_dir):
+
+    if filename.endswith(".aln"):
+        file_list.append(filename)
+
+        alignment = AlignIO.read(
+            os.path.join(input_dir, filename),
+            "fasta"
+        )
+
+        for record in alignment:
+            species_id = record.id.split("|")[0]
+            species_set.add(species_id)
+
+species_list = sorted(species_set)
+file_list = sorted(file_list)
+
+# 2. Initialize concatenated sequences
+concatenated_sequences = {
+    species: [] for species in species_list
+}
+
+# 3. Concatenate alignments in a consistent order
+for filename in file_list:
+
+    alignment = AlignIO.read(
+        os.path.join(input_dir, filename),
+        "fasta"
+    )
+
+    alignment_length = alignment.get_alignment_length()
+
+    current_sequences = {}
+
+    for record in alignment:
+        species = record.id.split("|")[0]
+        current_sequences[species] = str(record.seq)
+
+    # Insert gaps for species missing from an orthogroup
+    for species in species_list:
+
+        if species in current_sequences:
+            concatenated_sequences[species].append(
+                current_sequences[species]
+            )
+        else:
+            concatenated_sequences[species].append(
+                "-" * alignment_length
+            )
+
+# 4. Combine individual alignments
+for species in species_list:
+    concatenated_sequences[species] = "".join(
+        concatenated_sequences[species]
+    )
+
+# 5. Write the concatenated supermatrix in FASTA format
+with open(output_file, "w") as outfile:
+
+    for species in species_list:
+
+        outfile.write(f">{species}\n")
+
+        sequence = concatenated_sequences[species]
+
+        for i in range(0, len(sequence), 80):
+            outfile.write(sequence[i:i + 80] + "\n")
+
+# 6. Print summary statistics
+total_length = (
+    len(concatenated_sequences[species_list[0]])
+    if species_list else 0
+)
+
+print("Concatenated supermatrix generated successfully.")
+print(f"Number of species: {len(species_list)}")
+print(f"Total alignment length: {total_length}")
+print(f"Number of orthogroups: {len(file_list)}")
+print(f"Output file: {output_file}")
+
+
+# STEP: 6  Alignment Filtering with BMGE
+
+java -jar BMGE.jar -i super_matrix_concatenado.fas -t AA -of supermatriz_filtrada.fas
+
+
+# STEP: 7 Phylogenetic Reconstruction with IQ-TREE
+
+iqtree -s supermatriz_filtrada.fas \
+       -st AA \
+       -bb 1000 \
+       -bnni \
+       -T 45 \
+       -seed 1998 \
+       -m TEST \
+       -o Rhodoplanes_serenus,Rhodoplanes_elegans,Rhodoplanes_elegans \
+       -pre bradyrhizobium_phylogeny
+
+
+
+
+
+
+
+
